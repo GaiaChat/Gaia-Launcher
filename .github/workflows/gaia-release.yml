@@ -6,15 +6,15 @@ on:
       version:
         description: "Semver version to build"
         required: true
-        default: "0.2.0-beta.2"
+        default: "0.2.0-beta.3"
       tag:
         description: "Release tag"
         required: true
-        default: "v0.2.0-beta.2"
+        default: "v0.2.0-beta.3"
       release_name:
         description: "Release title"
         required: true
-        default: "Beta 3"
+        default: "Beta 4"
 
 permissions:
   contents: write
