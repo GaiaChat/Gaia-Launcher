@@ -24,6 +24,11 @@ let launcherContents: WebContents | null = null;
 let updaterConfigured = false;
 let currentState = createInitialUpdateState();
 
+function releaseChannelFromVersion(version: string): string | null {
+  const match = /^\d+\.\d+\.\d+-([0-9A-Za-z]+)(?:[.-][0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.exec(version);
+  return match?.[1] ?? null;
+}
+
 export function setUpdaterWebContents(contents: WebContents): void {
   launcherContents = contents;
   contents.once('destroyed', () => {
@@ -42,6 +47,11 @@ export function configureGaiaUpdater(): void {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.autoRunAppAfterInstall = true;
+  const releaseChannel = releaseChannelFromVersion(app.getVersion());
+  if (releaseChannel) {
+    autoUpdater.channel = releaseChannel;
+    autoUpdater.allowPrerelease = true;
+  }
   autoUpdater.logger = {
     info: (message?: unknown) => console.info('[gaia:updates]', message),
     warn: (message?: unknown) => console.warn('[gaia:updates]', message),

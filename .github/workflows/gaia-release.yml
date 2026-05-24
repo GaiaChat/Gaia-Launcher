@@ -72,12 +72,19 @@ jobs:
 
       - name: Verify update metadata
         run: |
-          test -f release-app/latest-linux.yml
-          grep -F "version: ${GAIA_RELEASE_VERSION}" release-app/latest-linux.yml
+          metadata_file="release-app/latest-linux.yml"
+          if [[ ! -f "${metadata_file}" && "${GAIA_RELEASE_VERSION}" == *-* ]]; then
+            channel="${GAIA_RELEASE_VERSION#*-}"
+            channel="${channel%%.*}"
+            metadata_file="release-app/${channel}-linux.yml"
+          fi
+          test -f "${metadata_file}"
+          cat "${metadata_file}"
+          grep -F "version: ${GAIA_RELEASE_VERSION}" "${metadata_file}"
 
       - name: Create GitHub release
         run: |
-          mapfile -t assets < <(find release-app -maxdepth 1 -type f \( -name 'latest-linux.yml' -o -name 'GaiaLauncher-*' \) | sort)
+          mapfile -t assets < <(find release-app -maxdepth 1 -type f \( -name '*-linux.yml' -o -name 'latest-linux.yml' -o -name 'GaiaLauncher-*' \) | sort)
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "No release assets found." >&2
             exit 1
