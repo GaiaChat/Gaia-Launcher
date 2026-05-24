@@ -1,0 +1,46 @@
+{
+  "name": "gaia-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gaia Launcher desktop app",
+  "homepage": "https://github.com/MinecraftOldschoolEdition/Gaia-Launcher",
+  "author": {
+    "name": "Gaia Launcher",
+    "email": "gaia-launcher@example.invalid"
+  },
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.main.json && mkdir -p dist/assets/appicon && cp src/assets/logo.svg src/assets/logo_grayscale.svg dist/assets/ && cp src/assets/appicon/gaia_app_icon.png dist/assets/appicon/ && vite build",
+    "dist": "node scripts/build-linux-artifacts.mjs --publish=never",
+    "dist:linux": "node scripts/build-linux-artifacts.mjs --publish=never",
+    "release:linux": "node scripts/build-linux-artifacts.mjs --publish=always",
+    "dev": "pnpm build && pnpm start",
+    "start": "./scripts/run-electron.sh",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit"
+  },
+  "dependencies": {
+    "@atproto/oauth-client-node": "^0.3.17",
+    "electron-updater": "^6.8.3",
+    "liquid-glass-react": "^1.1.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@types/three": "^0.184.1",
+    "electron": "^38.8.6",
+    "electron-builder": "^26.8.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
+  }
+}
