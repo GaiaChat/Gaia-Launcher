@@ -3,7 +3,7 @@ const releasePageUrl =
   process.env.GAIA_RELEASES_URL ||
   (updateBaseUrl
     ? updateBaseUrl.replace(/\/latest\/download\/?$/u, '/latest').replace(/\/download\/?$/u, '')
-    : 'https://github.com/MinecraftOldschoolEdition/Gaia-Launcher/releases/latest');
+    : 'https://github.com/GaiaChat/Gaia-Launcher/releases/latest');
 
 /** @type {import('electron-builder').Configuration} */
 module.exports = {

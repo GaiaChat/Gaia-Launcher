@@ -1,0 +1,89 @@
+name: Gaia Launcher Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver version to build"
+        required: true
+        default: "0.1.0-beta.1"
+      tag:
+        description: "Release tag"
+        required: true
+        default: "v0.1.0-beta.1"
+      release_name:
+        description: "Release title"
+        required: true
+        default: "Beta 1"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build Linux release
+    runs-on: ubuntu-latest
+    env:
+      GAIA_UPDATE_BASE_URL: https://github.com/GaiaChat/Gaia-Launcher/releases/latest/download
+      GAIA_RELEASES_URL: https://github.com/GaiaChat/Gaia-Launcher/releases/latest
+      GAIA_RELEASE_VERSION: ${{ inputs.version }}
+      GAIA_RELEASE_TAG: ${{ inputs.tag }}
+      GAIA_RELEASE_NAME: ${{ inputs.release_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.33.0"
+
+      - name: Install Linux packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot rpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stamp package version
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const version = process.env.GAIA_RELEASE_VERSION;
+          if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+            throw new Error(`Invalid semver version: ${version}`);
+          }
+          const packagePath = 'package.json';
+          const pkg = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+          pkg.version = version;
+          fs.writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+          NODE
+
+      - name: Build release artifacts
+        run: pnpm dist:linux
+
+      - name: Verify update metadata
+        run: |
+          test -f release-app/latest-linux.yml
+          grep -F "version: ${GAIA_RELEASE_VERSION}" release-app/latest-linux.yml
+
+      - name: Create GitHub release
+        run: |
+          mapfile -t assets < <(find release-app -maxdepth 1 -type f \( -name 'latest-linux.yml' -o -name 'GaiaLauncher-*' \) | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found." >&2
+            exit 1
+          fi
+          printf 'Release assets:\n'
+          printf '  %s\n' "${assets[@]}"
+          gh release create "${GAIA_RELEASE_TAG}" "${assets[@]}" \
+            --title "${GAIA_RELEASE_NAME}" \
+            --notes "Gaia Launcher ${GAIA_RELEASE_NAME} (${GAIA_RELEASE_VERSION})." \
+            --latest

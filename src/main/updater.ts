@@ -7,7 +7,7 @@ import type { GaiaUpdateInstallMode, GaiaUpdateProgress, GaiaUpdateState, GaiaUp
 
 const requireFromUpdater = createRequire(import.meta.url);
 const { autoUpdater } = requireFromUpdater('electron-updater') as typeof import('electron-updater');
-const DEFAULT_RELEASE_PAGE_URL = 'https://github.com/MinecraftOldschoolEdition/Gaia-Launcher/releases/latest';
+const DEFAULT_RELEASE_PAGE_URL = 'https://github.com/GaiaChat/Gaia-Launcher/releases/latest';
 const packagedMetadata = readPackagedGaiaMetadata();
 const UPDATE_FEED_URL =
   cleanUrl(process.env.GAIA_UPDATE_URL) ??
