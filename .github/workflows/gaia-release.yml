@@ -24,6 +24,7 @@ jobs:
     name: Build Linux release
     runs-on: ubuntu-latest
     env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       GAIA_UPDATE_BASE_URL: https://github.com/GaiaChat/Gaia-Launcher/releases/latest/download
       GAIA_RELEASES_URL: https://github.com/GaiaChat/Gaia-Launcher/releases/latest
       GAIA_RELEASE_VERSION: ${{ inputs.version }}
@@ -47,7 +48,7 @@ jobs:
       - name: Install Linux packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y fakeroot rpm
+          sudo apt-get install -y fakeroot libarchive-tools rpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
