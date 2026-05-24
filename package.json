@@ -1,6 +1,6 @@
 {
   "name": "gaia-launcher",
-  "version": "0.1.0-beta.1",
+  "version": "0.2.0-beta.1",
   "private": true,
   "type": "module",
   "description": "Gaia Launcher desktop app",
@@ -11,7 +11,7 @@
   },
   "main": "dist/main/main.js",
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.main.json && mkdir -p dist/assets/appicon && cp src/assets/logo.svg src/assets/logo_grayscale.svg dist/assets/ && cp src/assets/appicon/gaia_app_icon.png dist/assets/appicon/ && vite build",
+    "build": "rm -rf dist && tsc -p tsconfig.main.json && mkdir -p dist/assets && cp src/assets/logo.svg src/assets/logo_grayscale.svg dist/assets/ && cp -R src/assets/appicon dist/assets/ && vite build",
     "dist": "node scripts/build-linux-artifacts.mjs --publish=never",
     "dist:linux": "node scripts/build-linux-artifacts.mjs --publish=never",
     "release:linux": "node scripts/build-linux-artifacts.mjs --publish=always",

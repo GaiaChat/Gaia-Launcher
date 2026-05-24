@@ -84,8 +84,9 @@ const requireFromMain = createRequire(import.meta.url);
 const { NodeOAuthClient, buildAtprotoLoopbackClientMetadata, requestLocalLock } =
   requireFromMain('@atproto/oauth-client-node') as typeof import('@atproto/oauth-client-node');
 const GAIA_APP_ID = 'com.gaia.launcher';
-const GAIA_LINUX_DESKTOP_FILE = 'gaia-launcher-appimage.desktop';
+const GAIA_LINUX_DESKTOP_FILE = 'GaiaLauncher.desktop';
 const GAIA_LINUX_WM_CLASS = 'GaiaLauncher';
+const GAIA_APP_ICON_RELATIVE_PATH = 'assets/appicon/linux/256x256.png';
 const CURRENT_PARTITION = 'persist:gaia-current';
 const STORE_VERSION = 1;
 const DEFAULT_AUTH_HANDLE = 'https://bsky.social';
@@ -1697,6 +1698,12 @@ function gaiaLogoPath(): string | undefined {
 
 function gaiaAppIconPath(): string | undefined {
   const candidates = [
+    join(__dirname, '..', GAIA_APP_ICON_RELATIVE_PATH),
+    join(__dirname, '../../src/assets/appicon/linux/256x256.png'),
+    join(app.getAppPath(), 'src/assets/appicon/linux/256x256.png'),
+    join(app.getAppPath(), 'dist', GAIA_APP_ICON_RELATIVE_PATH),
+    join(process.cwd(), 'src/assets/appicon/linux/256x256.png'),
+    join(process.cwd(), 'dist', GAIA_APP_ICON_RELATIVE_PATH),
     join(__dirname, '../assets/appicon/gaia_app_icon.png'),
     join(__dirname, '../../src/assets/appicon/gaia_app_icon.png'),
     join(app.getAppPath(), 'src/assets/appicon/gaia_app_icon.png'),
@@ -4066,6 +4073,10 @@ function createWindow(): void {
       backgroundThrottling: false,
     },
   });
+
+  if (icon && process.platform !== 'darwin') {
+    mainWindow.setIcon(icon);
+  }
 
   mainWindow.webContents.backgroundThrottling = false;
   setUpdaterWebContents(mainWindow.webContents);

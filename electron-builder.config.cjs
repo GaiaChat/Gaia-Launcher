@@ -57,7 +57,7 @@ module.exports = {
       },
     ],
     category: 'Network',
-    icon: 'src/assets/appicon/gaia_app_icon.png',
+    icon: 'src/assets/appicon/linux',
     artifactName: 'GaiaLauncher-${version}-${arch}.${ext}',
     desktop: {
       entry: {
