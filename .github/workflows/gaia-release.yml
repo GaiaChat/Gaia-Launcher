@@ -70,6 +70,9 @@ jobs:
       - name: Build release artifacts
         run: pnpm dist:linux
 
+      - name: Refresh AppImage update metadata
+        run: pnpm exec electron-builder --config electron-builder.config.cjs --linux AppImage --publish=never
+
       - name: Verify update metadata
         run: |
           metadata_file="release-app/latest-linux.yml"
@@ -81,6 +84,7 @@ jobs:
           test -f "${metadata_file}"
           cat "${metadata_file}"
           grep -F "version: ${GAIA_RELEASE_VERSION}" "${metadata_file}"
+          grep -F "path: GaiaLauncher-${GAIA_RELEASE_VERSION}-x86_64.AppImage" "${metadata_file}"
 
       - name: Create GitHub release
         run: |
