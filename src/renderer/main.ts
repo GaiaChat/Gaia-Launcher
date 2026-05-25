@@ -60,6 +60,9 @@ const GIF_QUICK_TOPICS = [
 const MAX_GIF_RESULTS = 9;
 const MESSAGES_AUTO_REFRESH_MS = 12_000;
 const BSKY_NOTIFICATION_TRACK_LIMIT = 200;
+const LAUNCHER_UPDATE_STARTUP_CHECK_DELAY_MS = 8_000;
+const LAUNCHER_UPDATE_LIVE_CHECK_INTERVAL_MS = 60 * 60_000;
+const LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS = 15 * 60_000;
 
 type AuthProviderChoice = 'bluesky' | 'custom';
 const CURRENT_APPEARANCE_REFRESH_MS = 5_000;
@@ -147,16 +150,16 @@ const SETTINGS_SECTIONS: Array<{
     searchText: 'sound audio voice microphone mic input speaker output volume device echo cancellation noise suppression auto gain push to talk ptt keybind toggle hold',
   },
   {
-    id: 'updates',
-    title: 'Updates',
-    summary: 'Version checks, downloads, and install status.',
-    searchText: 'updates update version download appimage linux fedora bazzite arch cachyos rpm pacman deb latest release',
-  },
-  {
     id: 'performance',
     title: 'Performance',
     summary: 'Renderer diagnostics and frame pacing tools.',
     searchText: 'performance perf probe diagnostics fps frame pacing renderer logs reload fancy fast graphics liquid glass blur blurs pause animated backgrounds wallpaper',
+  },
+  {
+    id: 'updates',
+    title: 'Updates',
+    summary: 'Version checks, downloads, and install status.',
+    searchText: 'updates update version download appimage linux fedora bazzite arch cachyos rpm pacman deb latest release',
   },
 ];
 const liquidGlassLayerStyle: CSSProperties = {
@@ -538,6 +541,7 @@ root.innerHTML = `
             stroke-linejoin="round"
           />
         </svg>
+        <span class="rail-update-badge hidden" id="settingsUpdateBadge" aria-hidden="true">1</span>
       </button>
       <div class="rail-spacer"></div>
       <button class="rail-action logout-rail" id="logoutButton" title="Log out" aria-label="Log out">
@@ -861,6 +865,7 @@ const authProviderAddressLabel = document.querySelector<HTMLLabelElement>('#auth
 const authProviderAddressInput = document.querySelector<HTMLInputElement>('#authProviderAddressInput')!;
 const addServerButton = document.querySelector<HTMLButtonElement>('#addServerButton')!;
 const settingsButton = document.querySelector<HTMLButtonElement>('#settingsButton')!;
+const settingsUpdateBadge = document.querySelector<HTMLSpanElement>('#settingsUpdateBadge')!;
 const emptyAddServerButton = document.querySelector<HTMLButtonElement>('#emptyAddServerButton')!;
 const logoutButton = document.querySelector<HTMLButtonElement>('#logoutButton')!;
 const closeAuthButton = document.querySelector<HTMLButtonElement>('#closeAuthButton')!;
@@ -925,6 +930,9 @@ let settingsSearchQuery = '';
 let settingsSaveInFlight = false;
 let updateState: GaiaUpdateState | null = null;
 let updateActionInFlight: 'check' | 'download' | 'install' | 'downloads' | null = null;
+let updateLiveCheckInFlight = false;
+let updateLiveCheckTimer: number | null = null;
+let lastUpdateLiveCheckAttemptMs = 0;
 let accentPickerDraftColor: string | null = null;
 let audioDeviceLoadState: AudioDeviceLoadState = 'idle';
 let audioDeviceMessage = '';
@@ -3015,6 +3023,30 @@ function createSettingsActionGroup(...buttons: HTMLButtonElement[]): HTMLElement
   return group;
 }
 
+function hasLauncherUpdateAttention(state: GaiaUpdateState | null = updateState): boolean {
+  if (!state?.supported) {
+    return false;
+  }
+  return state.status === 'available' || state.status === 'downloaded' || state.status === 'downloading';
+}
+
+function syncLauncherUpdateBadge(): void {
+  const hasUpdate = hasLauncherUpdateAttention();
+  settingsButton.classList.toggle('has-launcher-update', hasUpdate);
+  settingsButton.dataset.updateAvailable = hasUpdate ? 'true' : 'false';
+  settingsUpdateBadge.classList.toggle('hidden', !hasUpdate);
+  settingsUpdateBadge.textContent = '1';
+
+  if (hasUpdate) {
+    const version = updateState?.availableVersion ? ` ${updateState.availableVersion}` : '';
+    settingsButton.title = `Settings - Gaia${version} update available`;
+    settingsButton.setAttribute('aria-label', `Settings, Gaia${version} update available`);
+  } else {
+    settingsButton.title = 'Settings';
+    settingsButton.setAttribute('aria-label', 'Settings');
+  }
+}
+
 function createUpdateStatusBadge(state: GaiaUpdateState | null): HTMLElement {
   const badge = document.createElement('span');
   badge.className = 'settings-update-badge';
@@ -3162,7 +3194,65 @@ async function runUpdateAction(action: 'check' | 'download' | 'install' | 'downl
   } finally {
     updateActionInFlight = null;
     renderSettingsWorkspace();
+    syncLauncherUpdateBadge();
   }
+}
+
+function updateCheckedAtMs(state: GaiaUpdateState | null): number {
+  if (!state?.checkedAt) {
+    return 0;
+  }
+  const parsed = Date.parse(state.checkedAt);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function canRunLauncherUpdateLiveCheck(minimumIntervalMs: number): boolean {
+  if (!updateState?.canCheck || updateLiveCheckInFlight || updateActionInFlight !== null) {
+    return false;
+  }
+  if (hasLauncherUpdateAttention(updateState)) {
+    return false;
+  }
+  if (updateState.status === 'checking' || updateState.status === 'downloading' || updateState.status === 'installing') {
+    return false;
+  }
+
+  const lastKnownCheckMs = Math.max(lastUpdateLiveCheckAttemptMs, updateCheckedAtMs(updateState));
+  return lastKnownCheckMs === 0 || Date.now() - lastKnownCheckMs >= minimumIntervalMs;
+}
+
+async function maybeCheckForLauncherUpdates(minimumIntervalMs = LAUNCHER_UPDATE_LIVE_CHECK_INTERVAL_MS): Promise<void> {
+  if (!canRunLauncherUpdateLiveCheck(minimumIntervalMs)) {
+    return;
+  }
+
+  updateLiveCheckInFlight = true;
+  lastUpdateLiveCheckAttemptMs = Date.now();
+  try {
+    updateState = await window.gaia.checkForUpdates();
+  } catch (error) {
+    console.warn('[gaia:updates] Background update check failed.', error);
+  } finally {
+    updateLiveCheckInFlight = false;
+    syncLauncherUpdateBadge();
+    if (activeView === 'settings' && activeSettingsSection === 'updates') {
+      renderSettingsWorkspace();
+    }
+  }
+}
+
+function startLauncherUpdateLiveChecks(): void {
+  if (updateLiveCheckTimer !== null) {
+    return;
+  }
+
+  window.setTimeout(() => {
+    void maybeCheckForLauncherUpdates(LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS);
+  }, LAUNCHER_UPDATE_STARTUP_CHECK_DELAY_MS);
+
+  updateLiveCheckTimer = window.setInterval(() => {
+    void maybeCheckForLauncherUpdates();
+  }, LAUNCHER_UPDATE_LIVE_CHECK_INTERVAL_MS);
 }
 
 function stopOutputTest(options: { render?: boolean } = {}): void {
@@ -5925,9 +6015,19 @@ function switchToNotificationsView(): void {
   updateViewVisibility();
 }
 
-function switchToSettingsView(): void {
+function switchToSettingsView(options: { section?: SettingsSectionId; clearSearch?: boolean } = {}): void {
   if (activeView === 'server' || activeView === 'messages') {
     lastContentView = activeView;
+  }
+  if (options.section) {
+    if (options.clearSearch) {
+      settingsSearchQuery = '';
+    }
+    soundKeyCaptureActive = false;
+    if (activeSettingsSection === 'sound' && options.section !== 'sound') {
+      stopMicrophoneTest({ render: false });
+    }
+    activeSettingsSection = options.section;
   }
   activeView = 'settings';
   hideServerContextMenu();
@@ -6574,6 +6674,7 @@ async function loadUpdateState(): Promise<void> {
     console.warn('[gaia:updates] Could not load update state.', error);
     updateState = null;
   }
+  syncLauncherUpdateBadge();
   if (activeView === 'settings' && activeSettingsSection === 'updates') {
     renderSettingsWorkspace();
   }
@@ -6595,6 +6696,7 @@ async function initialize(): Promise<void> {
   await refreshClientAuthStatus();
   await refreshStore();
   await loadUpdateState();
+  startLauncherUpdateLiveChecks();
   await loadNotificationCenter();
   renderMessagesViewport();
 }
@@ -8183,7 +8285,10 @@ notificationCenterClearButton.addEventListener('click', () => {
     renderNotificationCenter();
   });
 });
-settingsButton.addEventListener('click', switchToSettingsView);
+settingsButton.addEventListener('click', () => {
+  const hasUpdate = hasLauncherUpdateAttention();
+  switchToSettingsView(hasUpdate ? { section: 'updates', clearSearch: true } : undefined);
+});
 settingsButton.addEventListener('contextmenu', openRailAppearanceMenu);
 signedOutLoginButton.addEventListener('click', () => {
   openClientAuthChooser('app');
@@ -8413,8 +8518,18 @@ window.gaia.onNotificationsChanged((state) => {
 });
 window.gaia.onUpdateStateChanged((state) => {
   updateState = state;
+  syncLauncherUpdateBadge();
   if (activeView === 'settings' && activeSettingsSection === 'updates') {
     renderSettingsWorkspace();
+  }
+});
+
+window.addEventListener('focus', () => {
+  void maybeCheckForLauncherUpdates(LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS);
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    void maybeCheckForLauncherUpdates(LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS);
   }
 });
 

@@ -923,6 +923,31 @@ button {
     inset 0 1px 0 rgba(255, 255, 255, 0.34);
 }
 
+.rail-update-badge {
+  position: absolute;
+  top: -5px;
+  right: -6px;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  min-width: 19px;
+  height: 19px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  padding: 0 5px;
+  background:
+    linear-gradient(180deg, rgba(255, 89, 113, 0.98), rgba(196, 28, 53, 0.98)),
+    #d1243d;
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 950;
+  line-height: 1;
+  pointer-events: none;
+  box-shadow:
+    0 8px 18px rgba(130, 8, 32, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.36);
+}
+
 .notification-center {
   position: absolute;
   inset: 0;
@@ -1595,7 +1620,16 @@ button {
 }
 
 .settings-rail {
+  position: relative;
   color: var(--ink-soft);
+}
+
+.settings-rail.has-launcher-update {
+  border-color: rgba(255, 92, 118, 0.42);
+  color: #ff8fa3;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.18),
+    0 0 16px rgba(255, 59, 91, 0.2);
 }
 
 .settings-rail[data-active="true"],
@@ -3164,6 +3198,14 @@ button {
 
 .shell[data-resolved-appearance="light"] .settings-rail {
   color: var(--brand);
+}
+
+.shell[data-resolved-appearance="light"] .settings-rail.has-launcher-update {
+  border-color: rgba(207, 32, 64, 0.46);
+  color: #b51631;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    0 0 18px rgba(196, 28, 53, 0.18);
 }
 
 .shell[data-resolved-appearance="light"] .brand-mark:hover,
