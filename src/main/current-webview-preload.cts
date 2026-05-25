@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { GaiaAppearanceModePayload, GaiaSoundSettings } from '../shared.js';
+import type { GaiaAppearanceModePayload, GaiaSoundSettings, GaiaVisualEffectsSettings } from '../shared.js';
 
 const isWayland =
   process.platform === 'linux' &&
@@ -26,5 +26,12 @@ contextBridge.exposeInMainWorld('currentDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: GaiaSoundSettings) => callback(payload);
     ipcRenderer.on('gaia:sound-settings-changed', listener);
     return () => ipcRenderer.removeListener('gaia:sound-settings-changed', listener);
+  },
+  getVisualEffectsSettings: (): Promise<GaiaVisualEffectsSettings> =>
+    ipcRenderer.invoke('gaia:visual-effects-settings:get'),
+  onVisualEffectsSettingsChange: (callback: (payload: GaiaVisualEffectsSettings) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: GaiaVisualEffectsSettings) => callback(payload);
+    ipcRenderer.on('gaia:visual-effects-settings-changed', listener);
+    return () => ipcRenderer.removeListener('gaia:visual-effects-settings-changed', listener);
   },
 });

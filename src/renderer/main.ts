@@ -1,5 +1,6 @@
 import type {
   GaiaAuthResult,
+  GaiaAppearanceMode,
   GaiaBskyActor,
   GaiaBskyConvo,
   GaiaBskyConvoPage,
@@ -75,6 +76,8 @@ const SERVER_WEBVIEW_SUSPEND_MS = 2 * 60_000;
 const SERVER_PAGE_REVEAL_DELAY_MS = 120;
 const SERVER_WEBVIEW_ALLOWED_NAVIGATION_MS = 2_500;
 const WORKSPACE_PAGE_FADE_MS = 240;
+const STATIC_ANIMATED_BACKGROUND_CACHE_LIMIT = 6;
+const STATIC_ANIMATED_BACKGROUND_MAX_EDGE = 2_048;
 const DEFAULT_BACKGROUND_CSS = 'var(--gaia-default-bg)';
 const MESSAGES_BACKGROUND_CSS = 'var(--gaia-messages-bg)';
 const DEFAULT_ACCENT_COLOR = '#30b4ff';
@@ -108,6 +111,8 @@ const DEFAULT_GAIA_SETTINGS: GaiaSettings = {
   density: 'comfortable',
   reducedMotion: false,
   gifPlayback: 'always',
+  animatedCurrentBackgrounds: true,
+  fastGraphicsMode: false,
   perfProbe: false,
   sound: DEFAULT_SOUND_SETTINGS,
 };
@@ -127,7 +132,7 @@ const SETTINGS_SECTIONS: Array<{
     id: 'appearance',
     title: 'Appearance',
     summary: 'Theme, density, and motion preferences.',
-    searchText: 'appearance theme color mode light dark auto system display density compact comfortable reduced motion animations transitions',
+    searchText: 'appearance theme color mode light dark auto system display density compact comfortable reduced motion animations transitions current backgrounds animated wallpaper',
   },
   {
     id: 'messages',
@@ -151,7 +156,7 @@ const SETTINGS_SECTIONS: Array<{
     id: 'performance',
     title: 'Performance',
     summary: 'Renderer diagnostics and frame pacing tools.',
-    searchText: 'performance perf probe diagnostics fps frame pacing renderer logs reload',
+    searchText: 'performance perf probe diagnostics fps frame pacing renderer logs reload fancy fast graphics liquid glass blur blurs pause animated backgrounds wallpaper',
   },
 ];
 const liquidGlassLayerStyle: CSSProperties = {
@@ -200,7 +205,7 @@ type EmojiTonePickerState = {
   y: number;
 } | null;
 
-type MessageContextMenuItem = {
+type ContextMenuItem = {
   id: string;
   label: string;
   icon: string;
@@ -211,9 +216,15 @@ type MessageContextMenuItem = {
   run: () => void | Promise<void>;
 };
 
-type MessageContextMenuSection = {
+type ContextMenuSection = {
   id: string;
-  items: MessageContextMenuItem[];
+  items: ContextMenuItem[];
+};
+
+type ContextMenuRenderOptions = {
+  className: string;
+  dismiss: () => void;
+  errorMessage: string;
 };
 
 function isRendererPerfProbeEnabled(storageKey: string): boolean {
@@ -348,6 +359,9 @@ function startRendererPerfProbe(label: string, storageKey: string): void {
 type BackgroundSnapshot = {
   css: string;
   analysisUrl?: string;
+  animated?: boolean;
+  staticCss?: string;
+  staticAnalysisUrl?: string;
 };
 
 type ServerSessionSnapshot = {
@@ -508,7 +522,7 @@ root.innerHTML = `
       </button>
       <div class="server-list" id="serverList"></div>
       <button class="rail-action" id="addServerButton" title="Add server" aria-label="Add server">+</button>
-      <button class="rail-action settings-rail" id="settingsButton" title="Settings" aria-label="Settings">
+      <button class="rail-action settings-rail" id="settingsButton" title="Settings" aria-label="Settings" aria-haspopup="menu" aria-expanded="false">
         <svg class="rail-icon gear-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <path
             d="M12 8.35a3.65 3.65 0 1 1 0 7.3 3.65 3.65 0 0 1 0-7.3Z"
@@ -600,7 +614,7 @@ root.innerHTML = `
           </aside>
           <section class="message-thread chat-pane">
             <header class="thread-header chat-header">
-              <div class="chat-title-glass-shell glass-panel" id="threadTitleGlassShell">
+              <div class="chat-title-glass-shell glass-panel liquid-surface" id="threadTitleGlassShell">
                 <span class="liquid-glass-backdrop channel-title-liquid-glass" id="threadTitleLiquidGlass" aria-hidden="true"></span>
                 <span class="thread-eyebrow" id="threadEyebrow">Conversation</span>
                 <h1 id="threadTitle">Select a message</h1>
@@ -609,7 +623,7 @@ root.innerHTML = `
             </header>
             <div class="message-list messages-list" id="messageList"></div>
             <form class="composer message-composer" id="messageComposerForm">
-              <div class="composer-inline glass-panel composer-glass-panel" id="messageComposerGlassPanel">
+              <div class="composer-inline glass-panel composer-glass-panel liquid-surface" id="messageComposerGlassPanel">
                 <span class="liquid-glass-backdrop composer-liquid-glass" id="messageComposerLiquidGlass" aria-hidden="true"></span>
                 <textarea class="composer-input" id="messageComposerInput" rows="1" maxlength="10000" placeholder="Message"></textarea>
                 <div class="inline-actions">
@@ -781,6 +795,7 @@ root.innerHTML = `
       <button type="button" id="contextSignInButton" role="menuitem">Sign In</button>
     </div>
     <div class="context-menu discord-context-menu hidden" id="messageContextMenu" role="menu"></div>
+    <div class="context-menu discord-context-menu rail-appearance-menu hidden" id="railAppearanceMenu" role="menu"></div>
     <div class="gif-modal-backdrop hidden" id="gifModalBackdrop">
       <section class="gif-modal" id="gifModal">
         <header class="gif-modal-top">
@@ -887,6 +902,7 @@ const contextRefreshButton = document.querySelector<HTMLButtonElement>('#context
 const contextEditButton = document.querySelector<HTMLButtonElement>('#contextEditButton')!;
 const contextSignInButton = document.querySelector<HTMLButtonElement>('#contextSignInButton')!;
 const messageContextMenu = document.querySelector<HTMLDivElement>('#messageContextMenu')!;
+const railAppearanceMenu = document.querySelector<HTMLDivElement>('#railAppearanceMenu')!;
 const gifModalBackdrop = document.querySelector<HTMLDivElement>('#gifModalBackdrop')!;
 const gifModal = document.querySelector<HTMLElement>('#gifModal')!;
 const gifTabs = document.querySelector<HTMLDivElement>('#gifTabs')!;
@@ -1002,6 +1018,8 @@ const pendingReactionKeys = new Set<string>();
 const authAttempts = new Map<string, number>();
 const authFailures = new Set<string>();
 const manuallyLoggedOutServers = new Set<string>();
+const staticAnimatedBackgroundCache = new Map<string, string>();
+const pendingStaticAnimatedBackgrounds = new Map<string, Promise<string | undefined>>();
 const brightBackgroundCache = new Map<string, boolean>();
 const serverRailIdentityCache = new Map<string, {
   iconUrl?: string;
@@ -1051,24 +1069,39 @@ let landingGlobeTextureCache: Partial<Record<LandingGlobeTheme['mode'], THREE.Te
 let landingSceneUnavailable = false;
 let composerLiquidGlassRoot: Root | null = null;
 let composerLiquidGlassOverLight: boolean | null = null;
+let composerLiquidGlassFast: boolean | null = null;
 const composerLiquidGlassMouseContainer = { current: messageComposerGlassPanel };
 let threadTitleLiquidGlassRoot: Root | null = null;
 let threadTitleLiquidGlassOverLight: boolean | null = null;
+let threadTitleLiquidGlassFast: boolean | null = null;
 const threadTitleLiquidGlassMouseContainer = { current: threadTitleGlassShell };
 let serverDialogLiquidGlassRoot: Root | null = null;
 let serverDialogLiquidGlassOverLight: boolean | null = null;
+let serverDialogLiquidGlassFast: boolean | null = null;
 const serverDialogLiquidGlassMouseContainer = { current: serverForm };
+
+function fastGraphicsModeEnabled(settings = currentSettings()): boolean {
+  return settings.fastGraphicsMode;
+}
 
 function renderComposerLiquidGlass(): void {
   const overLight = shell.classList.contains('over-light-background');
-  if (composerLiquidGlassRoot && composerLiquidGlassOverLight === overLight) {
+  const fastGraphics = fastGraphicsModeEnabled();
+  if (
+    composerLiquidGlassRoot &&
+    composerLiquidGlassOverLight === overLight &&
+    composerLiquidGlassFast === fastGraphics
+  ) {
     return;
   }
 
   composerLiquidGlassRoot ??= createRoot(messageComposerLiquidGlass);
   composerLiquidGlassOverLight = overLight;
+  composerLiquidGlassFast = fastGraphics;
   composerLiquidGlassRoot.render(
-    createElement(
+    fastGraphics
+      ? createElement('span', { className: 'liquid-glass-fill' })
+      : createElement(
       LiquidGlass,
       {
         className: 'liquid-glass-layer',
@@ -1091,14 +1124,22 @@ function renderComposerLiquidGlass(): void {
 
 function renderThreadTitleLiquidGlass(): void {
   const overLight = shell.classList.contains('over-light-background');
-  if (threadTitleLiquidGlassRoot && threadTitleLiquidGlassOverLight === overLight) {
+  const fastGraphics = fastGraphicsModeEnabled();
+  if (
+    threadTitleLiquidGlassRoot &&
+    threadTitleLiquidGlassOverLight === overLight &&
+    threadTitleLiquidGlassFast === fastGraphics
+  ) {
     return;
   }
 
   threadTitleLiquidGlassRoot ??= createRoot(threadTitleLiquidGlass);
   threadTitleLiquidGlassOverLight = overLight;
+  threadTitleLiquidGlassFast = fastGraphics;
   threadTitleLiquidGlassRoot.render(
-    createElement(
+    fastGraphics
+      ? createElement('span', { className: 'liquid-glass-fill' })
+      : createElement(
       LiquidGlass,
       {
         className: 'liquid-glass-layer',
@@ -1121,15 +1162,23 @@ function renderThreadTitleLiquidGlass(): void {
 
 function renderServerDialogLiquidGlass(): void {
   const overLight = shell.classList.contains('over-light-background');
+  const fastGraphics = fastGraphicsModeEnabled();
   serverForm.classList.toggle('over-light-background', overLight);
-  if (serverDialogLiquidGlassRoot && serverDialogLiquidGlassOverLight === overLight) {
+  if (
+    serverDialogLiquidGlassRoot &&
+    serverDialogLiquidGlassOverLight === overLight &&
+    serverDialogLiquidGlassFast === fastGraphics
+  ) {
     return;
   }
 
   serverDialogLiquidGlassRoot ??= createRoot(serverDialogLiquidGlass);
   serverDialogLiquidGlassOverLight = overLight;
+  serverDialogLiquidGlassFast = fastGraphics;
   serverDialogLiquidGlassRoot.render(
-    createElement(
+    fastGraphics
+      ? createElement('span', { className: 'liquid-glass-fill' })
+      : createElement(
       LiquidGlass,
       {
         className: 'liquid-glass-layer',
@@ -1155,23 +1204,25 @@ function createMenuLiquidGlassBackdrop(overLight = shell.classList.contains('ove
   backdrop.className = 'liquid-glass-backdrop menu-liquid-glass';
   backdrop.setAttribute('aria-hidden', 'true');
   createRoot(backdrop).render(
-    createElement(
-      LiquidGlass,
-      {
-        className: 'liquid-glass-layer',
-        style: liquidGlassLayerStyle,
-        padding: '0',
-        cornerRadius: 14,
-        displacementScale: 72,
-        blurAmount: 0.14,
-        saturation: 148,
-        aberrationIntensity: 1.4,
-        elasticity: 0,
-        mode: 'prominent',
-        overLight,
-        children: createElement('span', { className: 'liquid-glass-fill' }),
-      },
-    ),
+    fastGraphicsModeEnabled()
+      ? createElement('span', { className: 'liquid-glass-fill' })
+      : createElement(
+          LiquidGlass,
+          {
+            className: 'liquid-glass-layer',
+            style: liquidGlassLayerStyle,
+            padding: '0',
+            cornerRadius: 14,
+            displacementScale: 72,
+            blurAmount: 0.14,
+            saturation: 148,
+            aberrationIntensity: 1.4,
+            elasticity: 0,
+            mode: 'prominent',
+            overLight,
+            children: createElement('span', { className: 'liquid-glass-fill' }),
+          },
+        ),
   );
   return backdrop;
 }
@@ -1199,9 +1250,18 @@ function refreshLiquidGlassSurfaceSizes(): void {
 }
 
 function cloneSettings(settings: GaiaSettings): GaiaSettings {
+  const sound = settings.sound ?? DEFAULT_SOUND_SETTINGS;
   return {
     ...settings,
-    sound: { ...settings.sound },
+    animatedCurrentBackgrounds:
+      typeof settings.animatedCurrentBackgrounds === 'boolean'
+        ? settings.animatedCurrentBackgrounds
+        : DEFAULT_GAIA_SETTINGS.animatedCurrentBackgrounds,
+    fastGraphicsMode:
+      typeof settings.fastGraphicsMode === 'boolean'
+        ? settings.fastGraphicsMode
+        : DEFAULT_GAIA_SETTINGS.fastGraphicsMode,
+    sound: { ...DEFAULT_SOUND_SETTINGS, ...sound },
   };
 }
 
@@ -1456,6 +1516,8 @@ function settingsEqual(left: GaiaSettings, right: GaiaSettings): boolean {
     left.density === right.density &&
     left.reducedMotion === right.reducedMotion &&
     left.gifPlayback === right.gifPlayback &&
+    left.animatedCurrentBackgrounds === right.animatedCurrentBackgrounds &&
+    left.fastGraphicsMode === right.fastGraphicsMode &&
     left.perfProbe === right.perfProbe &&
     soundSettingsEqual(left.sound, right.sound)
   );
@@ -1554,13 +1616,29 @@ function applyAppearanceMode(settings = currentSettings()): void {
 }
 
 function applyAppSettings(settings = currentSettings()): void {
+  const previousAnimatedBackgrounds = shell.dataset.animatedCurrentBackgrounds;
   applyAppearanceMode(settings);
   applyAccentColor(settings);
   shell.dataset.density = settings.density;
   shell.dataset.motion = settings.reducedMotion ? 'reduced' : 'full';
   shell.dataset.gifPlayback = settings.gifPlayback;
+  shell.dataset.animatedCurrentBackgrounds = settings.animatedCurrentBackgrounds ? 'enabled' : 'disabled';
+  shell.dataset.fastGraphics = settings.fastGraphicsMode ? 'true' : 'false';
   syncPerfProbeStorage(settings.perfProbe);
   syncVisibleGifPlayback();
+  renderFloatingLiquidGlassSurfaces();
+  if (
+    previousAnimatedBackgrounds &&
+    previousAnimatedBackgrounds !== shell.dataset.animatedCurrentBackgrounds &&
+    activeView === 'server'
+  ) {
+    const server = selectedServer();
+    const cachedBackground = server ? serverBackgroundCache.get(server.id) : undefined;
+    if (server && cachedBackground) {
+      setServerBackgroundSnapshot(server.id, cachedBackground);
+    }
+    void refreshCurrentAppearance();
+  }
   syncLandingScene(!clientAuthStatus.authenticated);
 }
 
@@ -3442,6 +3520,14 @@ function renderAppearanceSettings(draft: GaiaSettings): DocumentFragment {
       updateSettingsDraft({ reducedMotion }),
     ),
   );
+  appendSettingsRow(
+    motionCard,
+    'Animated Current backgrounds',
+    'Allows animated server wallpaper from Current when available.',
+    createSettingsToggle('Animated Current backgrounds', draft.animatedCurrentBackgrounds, (animatedCurrentBackgrounds) =>
+      updateSettingsDraft({ animatedCurrentBackgrounds }),
+    ),
+  );
   fragment.append(motionCard);
   return fragment;
 }
@@ -3604,6 +3690,31 @@ function renderSoundSettings(draft: GaiaSettings): DocumentFragment {
 
 function renderPerformanceSettings(draft: GaiaSettings): DocumentFragment {
   const fragment = document.createDocumentFragment();
+  const graphicsCard = createSettingsCard('Graphics', 'Prefer simpler materials on slower GPUs.');
+  appendSettingsRow(
+    graphicsCard,
+    'Graphics mode',
+    'Fancy keeps liquid glass effects. Fast uses static panels in Gaia and hosted Current servers.',
+    createSegmentedControl(
+      'Graphics mode',
+      [
+        { value: 'fancy', label: 'Fancy' },
+        { value: 'fast', label: 'Fast' },
+      ],
+      draft.fastGraphicsMode ? 'fast' : 'fancy',
+      (graphicsMode) => updateSettingsDraft({ fastGraphicsMode: graphicsMode === 'fast' }),
+    ),
+  );
+  appendSettingsRow(
+    graphicsCard,
+    'Pause animated backgrounds',
+    'Freezes animated Current server wallpapers on a still frame.',
+    createSettingsToggle('Pause animated backgrounds', !draft.animatedCurrentBackgrounds, (paused) =>
+      updateSettingsDraft({ animatedCurrentBackgrounds: !paused }),
+    ),
+  );
+  fragment.append(graphicsCard);
+
   const card = createSettingsCard('Renderer Diagnostics', 'Log frame-budget data from the renderer.');
   appendSettingsRow(
     card,
@@ -3752,6 +3863,47 @@ function settingsDraftForSave(): GaiaSettings | null {
   return draft;
 }
 
+function settingsPatchForSave(draft: GaiaSettings): GaiaSettingsPatch {
+  const current = currentSettings();
+  const patch: GaiaSettingsPatch = {};
+
+  if (draft.startupView !== current.startupView) {
+    patch.startupView = draft.startupView;
+  }
+  if (draft.lastContentView !== current.lastContentView) {
+    patch.lastContentView = draft.lastContentView;
+  }
+  if (draft.appearanceMode !== current.appearanceMode) {
+    patch.appearanceMode = draft.appearanceMode;
+  }
+  if (draft.accentColor !== current.accentColor) {
+    patch.accentColor = draft.accentColor;
+  }
+  if (draft.density !== current.density) {
+    patch.density = draft.density;
+  }
+  if (draft.reducedMotion !== current.reducedMotion) {
+    patch.reducedMotion = draft.reducedMotion;
+  }
+  if (draft.gifPlayback !== current.gifPlayback) {
+    patch.gifPlayback = draft.gifPlayback;
+  }
+  if (draft.animatedCurrentBackgrounds !== current.animatedCurrentBackgrounds) {
+    patch.animatedCurrentBackgrounds = draft.animatedCurrentBackgrounds;
+  }
+  if (draft.fastGraphicsMode !== current.fastGraphicsMode) {
+    patch.fastGraphicsMode = draft.fastGraphicsMode;
+  }
+  if (draft.perfProbe !== current.perfProbe) {
+    patch.perfProbe = draft.perfProbe;
+  }
+  if (!soundSettingsEqual(draft.sound, current.sound)) {
+    patch.sound = { ...draft.sound };
+  }
+
+  return patch;
+}
+
 async function saveSettingsDraft(): Promise<void> {
   if (!store) {
     return;
@@ -3761,16 +3913,17 @@ async function saveSettingsDraft(): Promise<void> {
   if (!draft || settingsEqual(draft, currentSettings())) {
     return;
   }
+  const patch = settingsPatchForSave(draft);
+  if (Object.keys(patch).length === 0) {
+    return;
+  }
 
   settingsDraft = draft;
   soundKeyCaptureActive = false;
   settingsSaveInFlight = true;
   renderSettingsWorkspace();
   try {
-    store = await window.gaia.updateSettings({
-      ...draft,
-      lastContentView: store.settings.lastContentView,
-    });
+    store = await window.gaia.updateSettings(patch);
     settingsDraft = cloneSettings(store.settings);
     lastContentView = store.settings.lastContentView;
     applyAppSettings(store.settings);
@@ -5032,6 +5185,132 @@ function firstCssImageUrl(value: string): string | undefined {
   return rawUrl?.replace(/\\(["'\\])/g, '$1');
 }
 
+function isAnimatedBackgroundUrl(url: string | undefined, mimeType?: string): boolean {
+  if (mimeType?.split(';')[0]?.trim().toLowerCase() === 'image/gif') {
+    return true;
+  }
+  if (!url) {
+    return false;
+  }
+  if (/^data:image\/gif[;,]/i.test(url) || /\.gif(?:[?#]|$)/i.test(url)) {
+    return true;
+  }
+  try {
+    const parsed = new URL(url, window.location.href);
+    return parsed.searchParams.get('format')?.toLowerCase() === 'gif';
+  } catch {
+    return false;
+  }
+}
+
+function rememberStaticAnimatedBackground(sourceUrl: string, staticUrl: string): string {
+  while (staticAnimatedBackgroundCache.size >= STATIC_ANIMATED_BACKGROUND_CACHE_LIMIT) {
+    const oldestKey = staticAnimatedBackgroundCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    staticAnimatedBackgroundCache.delete(oldestKey);
+  }
+  staticAnimatedBackgroundCache.set(sourceUrl, staticUrl);
+  return staticUrl;
+}
+
+function freezeAnimatedBackgroundFrame(sourceUrl: string): Promise<string | undefined> {
+  const cached = staticAnimatedBackgroundCache.get(sourceUrl);
+  if (cached) {
+    return Promise.resolve(cached);
+  }
+
+  const pending = pendingStaticAnimatedBackgrounds.get(sourceUrl);
+  if (pending) {
+    return pending;
+  }
+
+  const promise = new Promise<string | undefined>((resolve) => {
+    const image = new Image();
+    image.decoding = 'async';
+    image.crossOrigin = 'anonymous';
+    image.onload = () => {
+      try {
+        const naturalWidth = image.naturalWidth || image.width;
+        const naturalHeight = image.naturalHeight || image.height;
+        if (naturalWidth <= 0 || naturalHeight <= 0) {
+          resolve(undefined);
+          return;
+        }
+
+        const scale = Math.min(1, STATIC_ANIMATED_BACKGROUND_MAX_EDGE / Math.max(naturalWidth, naturalHeight));
+        const width = Math.max(1, Math.round(naturalWidth * scale));
+        const height = Math.max(1, Math.round(naturalHeight * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext('2d');
+        if (!context) {
+          resolve(undefined);
+          return;
+        }
+
+        context.imageSmoothingEnabled = scale < 1;
+        context.imageSmoothingQuality = 'high';
+        context.drawImage(image, 0, 0, width, height);
+        resolve(rememberStaticAnimatedBackground(sourceUrl, canvas.toDataURL('image/png')));
+      } catch {
+        resolve(undefined);
+      }
+    };
+    image.onerror = () => resolve(undefined);
+    image.src = sourceUrl;
+  }).finally(() => {
+    pendingStaticAnimatedBackgrounds.delete(sourceUrl);
+  });
+
+  pendingStaticAnimatedBackgrounds.set(sourceUrl, promise);
+  return promise;
+}
+
+function setServerBackgroundSnapshot(serverId: string, snapshot: BackgroundSnapshot): void {
+  if (selectedServerId !== serverId || activeView !== 'server') {
+    return;
+  }
+
+  if (!snapshot.animated || currentSettings().animatedCurrentBackgrounds) {
+    setCurrentBackgroundCss(snapshot.css, snapshot.analysisUrl);
+    return;
+  }
+
+  if (snapshot.staticCss) {
+    setCurrentBackgroundCss(snapshot.staticCss, snapshot.staticAnalysisUrl ?? firstCssImageUrl(snapshot.staticCss));
+    return;
+  }
+
+  const sourceUrl = snapshot.analysisUrl ?? firstCssImageUrl(snapshot.css);
+  if (!sourceUrl) {
+    setCurrentBackgroundCss(snapshot.css, snapshot.analysisUrl);
+    return;
+  }
+
+  void freezeAnimatedBackgroundFrame(sourceUrl).then((staticUrl) => {
+    if (
+      selectedServerId !== serverId ||
+      activeView !== 'server' ||
+      currentSettings().animatedCurrentBackgrounds ||
+      serverBackgroundCache.get(serverId) !== snapshot
+    ) {
+      return;
+    }
+
+    if (!staticUrl) {
+      setCurrentBackgroundCss(snapshot.css, snapshot.analysisUrl);
+      return;
+    }
+
+    snapshot.staticCss = cssImageUrl(staticUrl);
+    snapshot.staticAnalysisUrl = staticUrl;
+    setCurrentBackgroundCss(snapshot.staticCss, snapshot.staticAnalysisUrl);
+  });
+}
+
 function launcherRailWidth(): number {
   const parsedWidth = Number.parseFloat(getComputedStyle(shell).getPropertyValue('--rail-width'));
   return Number.isFinite(parsedWidth) && parsedWidth > 0 ? parsedWidth : 76;
@@ -5352,7 +5631,7 @@ function applyServerBackground(server: GaiaServer | undefined): void {
   setRailGlassColor(accent.red, accent.green, accent.blue);
 
   if (cachedBackground) {
-    setCurrentBackgroundCss(cachedBackground.css, cachedBackground.analysisUrl);
+    setServerBackgroundSnapshot(server.id, cachedBackground);
     return;
   }
 
@@ -5415,11 +5694,13 @@ async function refreshCurrentBackgroundFromWebview(): Promise<boolean> {
     if (!normalizedBackground || selectedServerId !== server.id || activeView !== 'server') {
       return false;
     }
-    serverBackgroundCache.set(server.id, {
+    const snapshot: BackgroundSnapshot = {
       css: normalizedBackground,
       analysisUrl: firstCssImageUrl(normalizedBackground),
-    });
-    setCurrentBackgroundCss(normalizedBackground);
+      animated: isAnimatedBackgroundUrl(firstCssImageUrl(normalizedBackground)),
+    };
+    serverBackgroundCache.set(server.id, snapshot);
+    setServerBackgroundSnapshot(server.id, snapshot);
     return true;
   } catch {
     return false;
@@ -5454,11 +5735,13 @@ async function refreshCurrentAppearance(): Promise<void> {
       return;
     }
     if (appearance.backgroundUrl) {
-      serverBackgroundCache.set(server.id, {
+      const snapshot: BackgroundSnapshot = {
         css: cssImageUrl(appearance.backgroundUrl),
         analysisUrl: appearance.backgroundUrl,
-      });
-      setCurrentBackground(appearance.backgroundUrl);
+        animated: isAnimatedBackgroundUrl(appearance.backgroundUrl, appearance.backgroundMimeType),
+      };
+      serverBackgroundCache.set(server.id, snapshot);
+      setServerBackgroundSnapshot(server.id, snapshot);
       return;
     }
 
@@ -5637,6 +5920,7 @@ function switchToNotificationsView(): void {
   activeView = 'notifications';
   hideServerContextMenu();
   hideMessageContextMenu();
+  hideRailAppearanceMenu();
   renderNotificationCenter();
   updateViewVisibility();
 }
@@ -5648,6 +5932,7 @@ function switchToSettingsView(): void {
   activeView = 'settings';
   hideServerContextMenu();
   hideMessageContextMenu();
+  hideRailAppearanceMenu();
   renderSettingsWorkspace();
   updateViewVisibility();
 }
@@ -5673,8 +5958,15 @@ function hideMessageContextMenu(): void {
   contextMessageId = null;
 }
 
+function hideRailAppearanceMenu(): void {
+  railAppearanceMenu.classList.add('hidden');
+  railAppearanceMenu.replaceChildren();
+  settingsButton.setAttribute('aria-expanded', 'false');
+}
+
 function openServerContextMenu(server: GaiaServer, x: number, y: number): void {
   hideMessageContextMenu();
+  hideRailAppearanceMenu();
   contextServerId = server.id;
   serverContextMenu.classList.remove('hidden');
   const menuRect = serverContextMenu.getBoundingClientRect();
@@ -5690,6 +5982,78 @@ function clampMenuPosition(x: number, y: number, width: number, height: number):
     x: Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - width - margin)),
     y: Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - height - margin)),
   };
+}
+
+function appearanceModeLabel(appearanceMode: GaiaAppearanceMode): string {
+  if (appearanceMode === 'light') {
+    return 'Light';
+  }
+  if (appearanceMode === 'dark') {
+    return 'Dark';
+  }
+  return 'Auto';
+}
+
+function activeAppearanceMode(): GaiaAppearanceMode {
+  return (settingsDraft ?? currentSettings()).appearanceMode;
+}
+
+async function switchAppearanceModeFromRail(appearanceMode: GaiaAppearanceMode): Promise<void> {
+  if (!store) {
+    return;
+  }
+
+  const previousDraft = settingsDraft ? cloneSettings(settingsDraft) : null;
+  try {
+    if (currentSettings().appearanceMode !== appearanceMode) {
+      store = await window.gaia.updateSettings({ appearanceMode });
+    }
+
+    if (previousDraft) {
+      settingsDraft = {
+        ...previousDraft,
+        appearanceMode,
+        sound: { ...previousDraft.sound },
+      };
+    } else {
+      settingsDraft = activeView === 'settings' ? cloneSettings(store.settings) : null;
+    }
+
+    applyAppSettings(settingsDraft ?? store.settings);
+    if (activeView === 'settings') {
+      renderSettingsWorkspace();
+    }
+    setStatus(`${appearanceModeLabel(appearanceMode)} mode`, 'good');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Theme switch failed', 'bad');
+  }
+}
+
+function railAppearanceMenuSections(): ContextMenuSection[] {
+  const appearanceMode = activeAppearanceMode();
+  return [
+    {
+      id: 'rail-appearance',
+      items: [
+        {
+          id: 'rail-appearance-light',
+          label: 'Light Mode',
+          icon: appearanceMode === 'light' ? '✓' : '☀',
+          disabled: appearanceMode === 'light',
+          disabledReason: 'Light mode is already active.',
+          run: () => switchAppearanceModeFromRail('light'),
+        },
+        {
+          id: 'rail-appearance-dark',
+          label: 'Dark Mode',
+          icon: appearanceMode === 'dark' ? '✓' : '☾',
+          disabled: appearanceMode === 'dark',
+          disabledReason: 'Dark mode is already active.',
+          run: () => switchAppearanceModeFromRail('dark'),
+        },
+      ],
+    },
+  ];
 }
 
 async function copyToClipboard(value: string, label: string): Promise<void> {
@@ -5726,7 +6090,7 @@ function senderProfileUrl(actor: GaiaBskyConvo['members'][number] | GaiaBskyProf
   return `https://bsky.app/profile/${encodeURIComponent(identifier.replace(/^@+/, ''))}`;
 }
 
-function messageContextMenuSections(message: GaiaBskyMessage): MessageContextMenuSection[] {
+function messageContextMenuSections(message: GaiaBskyMessage): ContextMenuSection[] {
   const convoId = selectedConvoId;
   const actor = actorForDid(message.senderDid) ?? (message.senderDid !== 'unknown' ? { did: message.senderDid } : undefined);
   const profileUrl = senderProfileUrl(actor);
@@ -5824,12 +6188,14 @@ function messageContextMenuSections(message: GaiaBskyMessage): MessageContextMen
   ];
 }
 
-function renderMessageContextMenu(sections: MessageContextMenuSection[]): void {
+function renderContextMenu(menu: HTMLDivElement, sections: ContextMenuSection[], options: ContextMenuRenderOptions): void {
   const overLight = shell.classList.contains('over-light-background');
-  const wasHidden = messageContextMenu.classList.contains('hidden');
-  messageContextMenu.className = `context-menu discord-context-menu context-menu-message liquid-surface ${overLight ? 'over-light-background' : ''}`;
+  const wasHidden = menu.classList.contains('hidden');
+  menu.className = `context-menu discord-context-menu ${options.className} liquid-surface ${
+    overLight ? 'over-light-background' : ''
+  }`;
   if (wasHidden) {
-    messageContextMenu.classList.add('hidden');
+    menu.classList.add('hidden');
   }
 
   const visibleSections = sections
@@ -5876,9 +6242,9 @@ function renderMessageContextMenu(sections: MessageContextMenuSection[]): void {
         if (item.disabled) {
           return;
         }
-        hideMessageContextMenu();
+        options.dismiss();
         void Promise.resolve(item.run()).catch((error) => {
-          setStatus(error instanceof Error ? error.message : 'Message action failed', 'bad');
+          setStatus(error instanceof Error ? error.message : options.errorMessage, 'bad');
         });
       });
       row.append(button);
@@ -5887,13 +6253,46 @@ function renderMessageContextMenu(sections: MessageContextMenuSection[]): void {
     fragment.append(group);
   });
 
-  messageContextMenu.replaceChildren(glassBackdrop, fragment);
+  menu.replaceChildren(glassBackdrop, fragment);
+}
+
+function renderMessageContextMenu(sections: ContextMenuSection[]): void {
+  renderContextMenu(messageContextMenu, sections, {
+    className: 'context-menu-message',
+    dismiss: hideMessageContextMenu,
+    errorMessage: 'Message action failed',
+  });
+}
+
+function renderRailAppearanceMenu(): void {
+  renderContextMenu(railAppearanceMenu, railAppearanceMenuSections(), {
+    className: 'rail-appearance-menu',
+    dismiss: hideRailAppearanceMenu,
+    errorMessage: 'Theme switch failed',
+  });
+}
+
+function openRailAppearanceMenu(event: MouseEvent): void {
+  event.preventDefault();
+  event.stopPropagation();
+  hideServerContextMenu();
+  hideMessageContextMenu();
+  renderRailAppearanceMenu();
+  railAppearanceMenu.style.left = `${event.clientX}px`;
+  railAppearanceMenu.style.top = `${event.clientY}px`;
+  railAppearanceMenu.classList.remove('hidden');
+  settingsButton.setAttribute('aria-expanded', 'true');
+  const rect = railAppearanceMenu.getBoundingClientRect();
+  const position = clampMenuPosition(event.clientX, event.clientY, rect.width, rect.height);
+  railAppearanceMenu.style.left = `${position.x}px`;
+  railAppearanceMenu.style.top = `${position.y}px`;
 }
 
 function openMessageContextMenu(event: MouseEvent, message: GaiaBskyMessage): void {
   event.preventDefault();
   event.stopPropagation();
   hideServerContextMenu();
+  hideRailAppearanceMenu();
   contextMessageId = message.id;
   renderMessageContextMenu(messageContextMenuSections(message));
   messageContextMenu.style.left = `${event.clientX}px`;
@@ -6607,14 +7006,21 @@ function renderMessagesViewport(): void {
     : 'Not signed in';
 
   const convo = selectedConvo();
+  const title = convo ? convoTitle(convo) : 'Select a message';
+  const subtitle = convo ? convoSubtitle(convo) : '';
   threadEyebrow.textContent = convo ? 'Conversation' : 'Conversation';
-  threadTitle.textContent = convo ? convoTitle(convo) : 'Select a message';
-  threadId.textContent = convo ? convoSubtitle(convo) : '';
+  threadTitle.textContent = title;
+  threadTitle.title = subtitle ? `${title} ${subtitle}` : title;
+  threadId.textContent = subtitle;
+  threadId.hidden = subtitle.length === 0;
+  threadTitleGlassShell.classList.toggle('has-thread-subtitle', subtitle.length > 0);
   messageComposerInput.disabled = !convo;
   messageSendButton.disabled = !convo || messageComposerInput.value.trim().length === 0;
 
   renderConvos();
   renderMessages();
+  renderFloatingLiquidGlassSurfaces();
+  refreshLiquidGlassSurfaceSizes();
 }
 
 function renderConvos(): void {
@@ -7778,6 +8184,7 @@ notificationCenterClearButton.addEventListener('click', () => {
   });
 });
 settingsButton.addEventListener('click', switchToSettingsView);
+settingsButton.addEventListener('contextmenu', openRailAppearanceMenu);
 signedOutLoginButton.addEventListener('click', () => {
   openClientAuthChooser('app');
 });
@@ -7942,6 +8349,12 @@ messageContextMenu.addEventListener('click', (event) => {
 messageContextMenu.addEventListener('contextmenu', (event) => {
   event.preventDefault();
 });
+railAppearanceMenu.addEventListener('click', (event) => {
+  event.stopPropagation();
+});
+railAppearanceMenu.addEventListener('contextmenu', (event) => {
+  event.preventDefault();
+});
 document.addEventListener('pointerdown', (event) => {
   if (!serverContextMenu.classList.contains('hidden') && !serverContextMenu.contains(event.target as Node)) {
     hideServerContextMenu();
@@ -7949,11 +8362,15 @@ document.addEventListener('pointerdown', (event) => {
   if (!messageContextMenu.classList.contains('hidden') && !messageContextMenu.contains(event.target as Node)) {
     hideMessageContextMenu();
   }
+  if (!railAppearanceMenu.classList.contains('hidden') && !railAppearanceMenu.contains(event.target as Node)) {
+    hideRailAppearanceMenu();
+  }
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     hideServerContextMenu();
     hideMessageContextMenu();
+    hideRailAppearanceMenu();
   }
 });
 window.addEventListener('focus', () => {

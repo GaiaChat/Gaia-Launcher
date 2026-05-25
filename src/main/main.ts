@@ -68,6 +68,7 @@ import type {
   GaiaGifSearchRequest,
   GaiaGifSearchResponse,
   GaiaUpdateState,
+  GaiaVisualEffectsSettings,
 } from '../shared.js';
 import {
   checkGaiaUpdates,
@@ -224,6 +225,12 @@ function currentWebviewRuntimeScript(): string {
       if (typeof existing.onSoundSettingsChange === 'function') {
         merged.onSoundSettingsChange = (callback) => existing.onSoundSettingsChange(callback);
       }
+      if (typeof existing.getVisualEffectsSettings === 'function') {
+        merged.getVisualEffectsSettings = () => existing.getVisualEffectsSettings();
+      }
+      if (typeof existing.onVisualEffectsSettingsChange === 'function') {
+        merged.onVisualEffectsSettingsChange = (callback) => existing.onVisualEffectsSettingsChange(callback);
+      }
       try {
         Object.defineProperty(window, 'currentDesktop', {
           configurable: true,
@@ -287,6 +294,28 @@ function sendCurrentSoundSettings(contents: Electron.WebContents, payload: GaiaS
 function broadcastCurrentSoundSettings(settings: GaiaSettings): void {
   for (const contents of currentWebviewContents) {
     sendCurrentSoundSettings(contents, settings.sound);
+  }
+}
+
+function visualEffectsSettings(settings: GaiaSettings): GaiaVisualEffectsSettings {
+  return {
+    animatedCurrentBackgrounds: settings.animatedCurrentBackgrounds,
+    fastGraphicsMode: settings.fastGraphicsMode,
+  };
+}
+
+function sendCurrentVisualEffectsSettings(contents: Electron.WebContents, payload: GaiaVisualEffectsSettings): void {
+  if (contents.isDestroyed()) {
+    currentWebviewContents.delete(contents);
+    return;
+  }
+  contents.send('gaia:visual-effects-settings-changed', payload);
+}
+
+function broadcastCurrentVisualEffectsSettings(settings: GaiaSettings): void {
+  const payload = visualEffectsSettings(settings);
+  for (const contents of currentWebviewContents) {
+    sendCurrentVisualEffectsSettings(contents, payload);
   }
 }
 
@@ -1026,6 +1055,8 @@ function defaultSettings(): GaiaSettings {
     density: 'comfortable',
     reducedMotion: false,
     gifPlayback: 'always',
+    animatedCurrentBackgrounds: true,
+    fastGraphicsMode: false,
     perfProbe: false,
     sound: defaultSoundSettings(),
   };
@@ -1561,6 +1592,11 @@ function coerceSettings(raw: Partial<GaiaSettings> | undefined | null): GaiaSett
       raw.gifPlayback === 'always' || raw.gifPlayback === 'focused' || raw.gifPlayback === 'never'
         ? raw.gifPlayback
         : fallback.gifPlayback,
+    animatedCurrentBackgrounds:
+      typeof raw.animatedCurrentBackgrounds === 'boolean'
+        ? raw.animatedCurrentBackgrounds
+        : fallback.animatedCurrentBackgrounds,
+    fastGraphicsMode: typeof raw.fastGraphicsMode === 'boolean' ? raw.fastGraphicsMode : fallback.fastGraphicsMode,
     perfProbe: typeof raw.perfProbe === 'boolean' ? raw.perfProbe : fallback.perfProbe,
     sound: coerceSoundSettings(raw.sound),
   };
@@ -3441,6 +3477,7 @@ async function getCurrentAppearance(serverUrl: string): Promise<GaiaCurrentAppea
       appearance?: {
         background?: {
           url?: unknown;
+          mimeType?: unknown;
         };
       };
     };
@@ -3451,7 +3488,9 @@ async function getCurrentAppearance(serverUrl: string): Promise<GaiaCurrentAppea
   const iconUrl = typeof payload.server?.iconUrl === 'string' && payload.server.iconUrl
     ? sameOriginHttpResourceUrl(payload.server.iconUrl, origin)
     : undefined;
-  const backgroundUrl = payload.server?.appearance?.background?.url;
+  const background = payload.server?.appearance?.background;
+  const backgroundUrl = background?.url;
+  const backgroundMimeType = typeof background?.mimeType === 'string' ? background.mimeType : undefined;
   const serverIconUrl = iconUrl
     ? await fetchCurrentImageDataUrl({
         absoluteUrl: iconUrl,
@@ -3477,6 +3516,7 @@ async function getCurrentAppearance(serverUrl: string): Promise<GaiaCurrentAppea
   return {
     serverName,
     serverIconUrl,
+    backgroundMimeType,
     backgroundUrl: await fetchCurrentImageDataUrl({
       absoluteUrl,
       cookieHeader,
@@ -3828,6 +3868,9 @@ function registerIpc(): void {
     resolveAppearanceMode((await readStore()).settings),
   );
   handleIpc('gaia:sound-settings:get', 'launcher-or-current-webview', async () => (await readStore()).settings.sound);
+  handleIpc('gaia:visual-effects-settings:get', 'launcher-or-current-webview', async () =>
+    visualEffectsSettings((await readStore()).settings),
+  );
 
   handleIpc('gaia:servers:add', 'launcher', async (_event, input: GaiaServerInput) => {
     const server = toServer(input);
@@ -3907,6 +3950,7 @@ function registerIpc(): void {
     }));
     broadcastCurrentAppearanceMode(nextStore.settings);
     broadcastCurrentSoundSettings(nextStore.settings);
+    broadcastCurrentVisualEffectsSettings(nextStore.settings);
     return nextStore;
   });
 
@@ -4147,6 +4191,7 @@ function createWindow(): void {
       .then((store) => {
         sendCurrentAppearanceMode(webContents, resolveAppearanceMode(store.settings));
         sendCurrentSoundSettings(webContents, store.settings.sound);
+        sendCurrentVisualEffectsSettings(webContents, visualEffectsSettings(store.settings));
       })
       .catch(() => undefined);
   });

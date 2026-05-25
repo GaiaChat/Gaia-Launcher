@@ -35,6 +35,11 @@ export interface GaiaSoundSettings {
   pushToTalkKey: string;
 }
 
+export interface GaiaVisualEffectsSettings {
+  animatedCurrentBackgrounds: boolean;
+  fastGraphicsMode: boolean;
+}
+
 export interface GaiaSettings {
   startupView: GaiaStartupView;
   lastContentView: GaiaLastContentView;
@@ -43,6 +48,8 @@ export interface GaiaSettings {
   density: GaiaDensity;
   reducedMotion: boolean;
   gifPlayback: GaiaGifPlayback;
+  animatedCurrentBackgrounds: boolean;
+  fastGraphicsMode: boolean;
   perfProbe: boolean;
   sound: GaiaSoundSettings;
 }
@@ -170,6 +177,7 @@ export interface GaiaServerProbe {
 
 export interface GaiaCurrentAppearance {
   backgroundUrl?: string;
+  backgroundMimeType?: string;
   serverName?: string;
   serverIconUrl?: string;
 }
