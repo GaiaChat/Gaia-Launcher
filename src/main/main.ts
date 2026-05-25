@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  desktopCapturer,
   ipcMain,
   Notification,
   nativeImage,
@@ -170,14 +171,34 @@ function resolveLinuxOzonePlatform(): string | undefined {
   return isWaylandEnvironment() ? 'wayland' : undefined;
 }
 
-function denyWaylandDisplayCapture(targetSession: Electron.Session): void {
-  if (!isWaylandEnvironment()) {
-    return;
-  }
-
-  targetSession.setDisplayMediaRequestHandler((_request, callback) => {
-    callback({});
+async function resolveFallbackDisplayCaptureSource(): Promise<Electron.Video | null> {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen', 'window'],
+    thumbnailSize: { width: 0, height: 0 },
+    fetchWindowIcons: false,
   });
+  const source = sources.find((candidate) => candidate.id.startsWith('screen:')) ?? sources[0];
+  return source ? { id: source.id, name: source.name } : null;
+}
+
+function configureDisplayCapture(targetSession: Electron.Session, scope: string): void {
+  targetSession.setDisplayMediaRequestHandler(
+    async (_request, callback) => {
+      try {
+        const source = await resolveFallbackDisplayCaptureSource();
+        if (!source) {
+          console.warn(`[gaia:${scope}:display-capture] no display capture sources were available`);
+          callback({});
+          return;
+        }
+        callback({ video: source });
+      } catch (error) {
+        console.error(`[gaia:${scope}:display-capture] failed to resolve display capture sources`, error);
+        callback({});
+      }
+    },
+    { useSystemPicker: true },
+  );
 }
 
 function sanitizeColorPickPoint(point: ColorPickPoint): Electron.Rectangle {
@@ -3847,19 +3868,15 @@ async function ensureCallbackServer(): Promise<number> {
 function configureCurrentPartition(): void {
   const currentSession = session.fromPartition(CURRENT_PARTITION);
   currentSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    const allowedPermissions = isWaylandEnvironment()
-      ? ['media', 'speaker-selection']
-      : ['media', 'speaker-selection', 'display-capture'];
-    callback(allowedPermissions.includes(permission));
+    callback(['media', 'speaker-selection', 'display-capture'].includes(permission));
   });
-  denyWaylandDisplayCapture(currentSession);
+  configureDisplayCapture(currentSession, 'current');
 }
 
 function configureLauncherSession(): void {
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media', 'speaker-selection'].includes(permission));
   });
-  denyWaylandDisplayCapture(session.defaultSession);
 }
 
 function registerIpc(): void {
