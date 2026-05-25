@@ -18,6 +18,7 @@ export type GaiaGifPlayback = 'always' | 'focused' | 'never';
 export type GaiaAppearanceMode = 'auto' | 'light' | 'dark';
 export type GaiaResolvedAppearanceMode = 'light' | 'dark';
 export type GaiaPushToTalkMode = 'voice_activity' | 'hold' | 'toggle';
+export type GaiaCameraResolution = '480p' | '720p' | '1080p';
 
 export interface GaiaAppearanceModePayload {
   mode: GaiaAppearanceMode;
@@ -40,6 +41,13 @@ export interface GaiaVisualEffectsSettings {
   fastGraphicsMode: boolean;
 }
 
+export interface GaiaVideoSettings {
+  cameraDeviceId: string;
+  cameraResolution: GaiaCameraResolution;
+  cameraFrameRate: number;
+  mirrorPreview: boolean;
+}
+
 export interface GaiaSettings {
   startupView: GaiaStartupView;
   lastContentView: GaiaLastContentView;
@@ -52,6 +60,7 @@ export interface GaiaSettings {
   fastGraphicsMode: boolean;
   perfProbe: boolean;
   sound: GaiaSoundSettings;
+  video: GaiaVideoSettings;
 }
 
 export type GaiaSettingsPatch = Partial<GaiaSettings>;

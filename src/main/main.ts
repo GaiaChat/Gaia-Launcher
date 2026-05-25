@@ -23,7 +23,7 @@ import type {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { isIP, type AddressInfo } from 'node:net';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -69,6 +69,7 @@ import type {
   GaiaGifSearchRequest,
   GaiaGifSearchResponse,
   GaiaUpdateState,
+  GaiaVideoSettings,
   GaiaVisualEffectsSettings,
 } from '../shared.js';
 import {
@@ -88,6 +89,9 @@ const { NodeOAuthClient, buildAtprotoLoopbackClientMetadata, requestLocalLock } 
 const GAIA_APP_ID = 'com.gaia.launcher';
 const GAIA_LINUX_DESKTOP_FILE = 'GaiaLauncher.desktop';
 const GAIA_LINUX_WM_CLASS = 'GaiaLauncher';
+const GAIA_USAGE_PING_URL = process.env.GAIA_USAGE_PING_URL || 'https://gaiachat.github.io/api/usage/ping';
+const GAIA_USAGE_HEARTBEAT_MS = 60_000;
+const GAIA_USAGE_CLIENT_ID_FILE = 'usage-client-id';
 const GAIA_APP_ICON_RELATIVE_PATH = 'assets/appicon/linux/256x256.png';
 const CURRENT_PARTITION = 'persist:gaia-current';
 const STORE_VERSION = 1;
@@ -246,6 +250,12 @@ function currentWebviewRuntimeScript(): string {
       if (typeof existing.onSoundSettingsChange === 'function') {
         merged.onSoundSettingsChange = (callback) => existing.onSoundSettingsChange(callback);
       }
+      if (typeof existing.getVideoSettings === 'function') {
+        merged.getVideoSettings = () => existing.getVideoSettings();
+      }
+      if (typeof existing.onVideoSettingsChange === 'function') {
+        merged.onVideoSettingsChange = (callback) => existing.onVideoSettingsChange(callback);
+      }
       if (typeof existing.getVisualEffectsSettings === 'function') {
         merged.getVisualEffectsSettings = () => existing.getVisualEffectsSettings();
       }
@@ -315,6 +325,20 @@ function sendCurrentSoundSettings(contents: Electron.WebContents, payload: GaiaS
 function broadcastCurrentSoundSettings(settings: GaiaSettings): void {
   for (const contents of currentWebviewContents) {
     sendCurrentSoundSettings(contents, settings.sound);
+  }
+}
+
+function sendCurrentVideoSettings(contents: Electron.WebContents, payload: GaiaVideoSettings): void {
+  if (contents.isDestroyed()) {
+    currentWebviewContents.delete(contents);
+    return;
+  }
+  contents.send('gaia:video-settings-changed', payload);
+}
+
+function broadcastCurrentVideoSettings(settings: GaiaSettings): void {
+  for (const contents of currentWebviewContents) {
+    sendCurrentVideoSettings(contents, settings.video);
   }
 }
 
@@ -451,6 +475,8 @@ let callbackServer: Server | null = null;
 let callbackPort: number | null = null;
 let bskyOAuthClient: NodeOAuthClientType | null = null;
 let bskyOAuthClientCallbackUrl: string | null = null;
+let usageHeartbeatTimer: NodeJS.Timeout | null = null;
+let usageClientIdPromise: Promise<string> | null = null;
 const currentWebviewContents = new Set<WebContents>();
 const avatarCacheInFlight = new Map<string, Promise<string>>();
 const avatarCacheExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif'];
@@ -1080,6 +1106,7 @@ function defaultSettings(): GaiaSettings {
     fastGraphicsMode: false,
     perfProbe: false,
     sound: defaultSoundSettings(),
+    video: defaultVideoSettings(),
   };
 }
 
@@ -1096,8 +1123,86 @@ function defaultSoundSettings(): GaiaSoundSettings {
   };
 }
 
+function defaultVideoSettings(): GaiaVideoSettings {
+  return {
+    cameraDeviceId: 'default',
+    cameraResolution: '720p',
+    cameraFrameRate: 30,
+    mirrorPreview: true,
+  };
+}
+
 function storePath(): string {
   return join(app.getPath('userData'), 'servers.json');
+}
+
+function usageClientIdPath(): string {
+  return join(app.getPath('userData'), GAIA_USAGE_CLIENT_ID_FILE);
+}
+
+async function usageClientId(): Promise<string> {
+  if (usageClientIdPromise) {
+    return usageClientIdPromise;
+  }
+
+  usageClientIdPromise = (async () => {
+    const existing = await readFile(usageClientIdPath(), 'utf8').catch(() => '');
+    const trimmed = existing.trim();
+    if (/^[a-f0-9-]{24,64}$/i.test(trimmed)) {
+      return trimmed;
+    }
+
+    const nextId = randomUUID();
+    await writeFile(usageClientIdPath(), `${nextId}\n`, 'utf8').catch(() => undefined);
+    return nextId;
+  })();
+
+  return usageClientIdPromise;
+}
+
+async function pingGaiaWebsiteUsage(): Promise<void> {
+  if (!GAIA_USAGE_PING_URL || process.env.GAIA_USAGE_PING_DISABLED === '1') {
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    await fetch(GAIA_USAGE_PING_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        app: 'gaia-launcher',
+        clientId: await usageClientId(),
+        version: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        sentAt: new Date().toISOString(),
+      }),
+      signal: controller.signal,
+    });
+  } catch {
+    // Usage presence is best-effort and should never interrupt launcher startup.
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function startGaiaWebsiteUsageHeartbeat(): void {
+  if (usageHeartbeatTimer || !GAIA_USAGE_PING_URL || process.env.GAIA_USAGE_PING_DISABLED === '1') {
+    return;
+  }
+  void pingGaiaWebsiteUsage();
+  usageHeartbeatTimer = setInterval(() => {
+    void pingGaiaWebsiteUsage();
+  }, GAIA_USAGE_HEARTBEAT_MS);
+}
+
+function stopGaiaWebsiteUsageHeartbeat(): void {
+  if (usageHeartbeatTimer) {
+    clearInterval(usageHeartbeatTimer);
+    usageHeartbeatTimer = null;
+  }
 }
 
 function bskyAuthStorePath(): string {
@@ -1620,6 +1725,7 @@ function coerceSettings(raw: Partial<GaiaSettings> | undefined | null): GaiaSett
     fastGraphicsMode: typeof raw.fastGraphicsMode === 'boolean' ? raw.fastGraphicsMode : fallback.fastGraphicsMode,
     perfProbe: typeof raw.perfProbe === 'boolean' ? raw.perfProbe : fallback.perfProbe,
     sound: coerceSoundSettings(raw.sound),
+    video: coerceVideoSettings(raw.video),
   };
 }
 
@@ -1665,6 +1771,23 @@ function coerceSoundSettings(raw: Partial<GaiaSoundSettings> | undefined | null)
         ? raw.pushToTalkMode
         : fallback.pushToTalkMode,
     pushToTalkKey: coercePushToTalkKey(raw.pushToTalkKey, fallback.pushToTalkKey),
+  };
+}
+
+function coerceVideoSettings(raw: Partial<GaiaVideoSettings> | undefined | null): GaiaVideoSettings {
+  const fallback = defaultVideoSettings();
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  return {
+    cameraDeviceId: coerceDeviceId(raw.cameraDeviceId, fallback.cameraDeviceId),
+    cameraResolution:
+      raw.cameraResolution === '480p' || raw.cameraResolution === '720p' || raw.cameraResolution === '1080p'
+        ? raw.cameraResolution
+        : fallback.cameraResolution,
+    cameraFrameRate: Math.round(clampNumber(raw.cameraFrameRate, fallback.cameraFrameRate, 1, 60)),
+    mirrorPreview: typeof raw.mirrorPreview === 'boolean' ? raw.mirrorPreview : fallback.mirrorPreview,
   };
 }
 
@@ -3885,6 +4008,7 @@ function registerIpc(): void {
     resolveAppearanceMode((await readStore()).settings),
   );
   handleIpc('gaia:sound-settings:get', 'launcher-or-current-webview', async () => (await readStore()).settings.sound);
+  handleIpc('gaia:video-settings:get', 'launcher-or-current-webview', async () => (await readStore()).settings.video);
   handleIpc('gaia:visual-effects-settings:get', 'launcher-or-current-webview', async () =>
     visualEffectsSettings((await readStore()).settings),
   );
@@ -3967,6 +4091,7 @@ function registerIpc(): void {
     }));
     broadcastCurrentAppearanceMode(nextStore.settings);
     broadcastCurrentSoundSettings(nextStore.settings);
+    broadcastCurrentVideoSettings(nextStore.settings);
     broadcastCurrentVisualEffectsSettings(nextStore.settings);
     return nextStore;
   });
@@ -4208,6 +4333,7 @@ function createWindow(): void {
       .then((store) => {
         sendCurrentAppearanceMode(webContents, resolveAppearanceMode(store.settings));
         sendCurrentSoundSettings(webContents, store.settings.sound);
+        sendCurrentVideoSettings(webContents, store.settings.video);
         sendCurrentVisualEffectsSettings(webContents, visualEffectsSettings(store.settings));
       })
       .catch(() => undefined);
@@ -4236,6 +4362,7 @@ app.whenReady().then(() => {
   configureGaiaUpdater();
   registerIpc();
   createWindow();
+  startGaiaWebsiteUsageHeartbeat();
   void syncCurrentNotificationWatchers();
   void notifyNotificationCenterChanged().catch(() => undefined);
 
@@ -4266,6 +4393,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  stopGaiaWebsiteUsageHeartbeat();
   for (const watcher of currentNotificationWatchers.values()) {
     stopCurrentNotificationWatcher(watcher);
   }

@@ -2611,6 +2611,53 @@ button {
   text-align: right;
 }
 
+.camera-preview-control {
+  display: inline-grid;
+  grid-template-columns: 220px auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.camera-preview-frame {
+  position: relative;
+  width: 220px;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid rgba(235, 247, 255, 0.16);
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 20% 18%, rgba(var(--brand-rgb), 0.22), transparent 38%),
+    rgba(3, 10, 18, 0.36);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    0 14px 28px rgba(0, 0, 0, 0.18);
+}
+
+.camera-preview-frame video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: rgba(3, 10, 18, 0.5);
+}
+
+.camera-preview-frame video.mirrored {
+  transform: scaleX(-1);
+}
+
+.camera-preview-frame span {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: rgba(235, 247, 255, 0.72);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.camera-preview-frame[data-state="active"] span {
+  display: none;
+}
+
 .settings-inline-actions {
   display: inline-flex;
   align-items: center;
@@ -5899,6 +5946,14 @@ button {
   .sound-test-control .settings-secondary-action {
     grid-column: 1 / -1;
     justify-self: start;
+  }
+
+  .camera-preview-control {
+    grid-template-columns: minmax(180px, 1fr);
+  }
+
+  .camera-preview-frame {
+    width: 100%;
   }
 
   .settings-inline-actions {

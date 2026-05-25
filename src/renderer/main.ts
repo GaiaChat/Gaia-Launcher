@@ -22,6 +22,7 @@ import type {
   GaiaSoundSettings,
   GaiaStore,
   GaiaUpdateState,
+  GaiaVideoSettings,
 } from '../shared';
 import { createElement, type CSSProperties } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
@@ -106,6 +107,12 @@ const DEFAULT_SOUND_SETTINGS: GaiaSoundSettings = {
   pushToTalkMode: 'hold',
   pushToTalkKey: 'Space',
 };
+const DEFAULT_VIDEO_SETTINGS: GaiaVideoSettings = {
+  cameraDeviceId: 'default',
+  cameraResolution: '720p',
+  cameraFrameRate: 30,
+  mirrorPreview: true,
+};
 const DEFAULT_GAIA_SETTINGS: GaiaSettings = {
   startupView: 'last',
   lastContentView: 'server',
@@ -118,6 +125,7 @@ const DEFAULT_GAIA_SETTINGS: GaiaSettings = {
   fastGraphicsMode: false,
   perfProbe: false,
   sound: DEFAULT_SOUND_SETTINGS,
+  video: DEFAULT_VIDEO_SETTINGS,
 };
 const SETTINGS_SECTIONS: Array<{
   id: SettingsSectionId;
@@ -145,9 +153,9 @@ const SETTINGS_SECTIONS: Array<{
   },
   {
     id: 'sound',
-    title: 'Sound',
-    summary: 'Voice devices, output volume, and push-to-talk.',
-    searchText: 'sound audio voice microphone mic input speaker output volume device echo cancellation noise suppression auto gain push to talk ptt keybind toggle hold',
+    title: 'Devices & Sound',
+    summary: 'Voice, camera, output volume, and push-to-talk.',
+    searchText: 'devices sound audio video camera webcam voice microphone mic input speaker output volume device echo cancellation noise suppression auto gain push to talk ptt keybind toggle hold preview resolution frame rate mirror',
   },
   {
     id: 'performance',
@@ -179,20 +187,30 @@ const systemAppearanceQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
 type PickerTab = 'gifs' | 'emoji';
 type SettingsSectionId = 'general' | 'appearance' | 'messages' | 'sound' | 'updates' | 'performance';
+type MediaDeviceChoiceKind = 'audioinput' | 'audiooutput' | 'videoinput';
 type AudioDeviceChoice = {
   deviceId: string;
   label: string;
   kind: 'audioinput' | 'audiooutput';
 };
+type VideoDeviceChoice = {
+  deviceId: string;
+  label: string;
+  kind: 'videoinput';
+};
 type AudioDeviceLoadState = 'idle' | 'loading' | 'ready' | 'failed';
 type OutputTestState = 'idle' | 'playing' | 'failed';
 type MicrophoneTestState = 'idle' | 'starting' | 'active' | 'failed';
+type CameraPreviewState = 'idle' | 'starting' | 'active' | 'failed';
 type MicrophoneTestRuntime = {
   analyser: AnalyserNode;
   context: AudioContext;
   data: Uint8Array<ArrayBuffer>;
   rafId: number;
   source: MediaStreamAudioSourceNode;
+  stream: MediaStream;
+};
+type CameraPreviewRuntime = {
   stream: MediaStream;
 };
 type GifTile = {
@@ -938,6 +956,7 @@ let audioDeviceLoadState: AudioDeviceLoadState = 'idle';
 let audioDeviceMessage = '';
 let audioInputDevices: AudioDeviceChoice[] = [];
 let audioOutputDevices: AudioDeviceChoice[] = [];
+let videoInputDevices: VideoDeviceChoice[] = [];
 let soundKeyCaptureActive = false;
 let outputTestState: OutputTestState = 'idle';
 let outputTestMessage = 'Play a notification sound through the selected speakers.';
@@ -949,6 +968,9 @@ let microphoneTestState: MicrophoneTestState = 'idle';
 let microphoneTestMessage = 'Start a local mic test to check the selected input.';
 let microphoneTestLevel = 0;
 let microphoneTestRuntime: MicrophoneTestRuntime | null = null;
+let cameraPreviewState: CameraPreviewState = 'idle';
+let cameraPreviewMessage = 'Start a camera preview to check your selected webcam.';
+let cameraPreviewRuntime: CameraPreviewRuntime | null = null;
 let authServerId: string | null = null;
 let authRequestId: string | null = null;
 let contextServerId: string | null = null;
@@ -1259,6 +1281,7 @@ function refreshLiquidGlassSurfaceSizes(): void {
 
 function cloneSettings(settings: GaiaSettings): GaiaSettings {
   const sound = settings.sound ?? DEFAULT_SOUND_SETTINGS;
+  const video = settings.video ?? DEFAULT_VIDEO_SETTINGS;
   return {
     ...settings,
     animatedCurrentBackgrounds:
@@ -1270,6 +1293,7 @@ function cloneSettings(settings: GaiaSettings): GaiaSettings {
         ? settings.fastGraphicsMode
         : DEFAULT_GAIA_SETTINGS.fastGraphicsMode,
     sound: { ...DEFAULT_SOUND_SETTINGS, ...sound },
+    video: { ...DEFAULT_VIDEO_SETTINGS, ...video },
   };
 }
 
@@ -1527,7 +1551,8 @@ function settingsEqual(left: GaiaSettings, right: GaiaSettings): boolean {
     left.animatedCurrentBackgrounds === right.animatedCurrentBackgrounds &&
     left.fastGraphicsMode === right.fastGraphicsMode &&
     left.perfProbe === right.perfProbe &&
-    soundSettingsEqual(left.sound, right.sound)
+    soundSettingsEqual(left.sound, right.sound) &&
+    videoSettingsEqual(left.video, right.video)
   );
 }
 
@@ -1541,6 +1566,15 @@ function soundSettingsEqual(left: GaiaSoundSettings, right: GaiaSoundSettings): 
     left.autoGainControl === right.autoGainControl &&
     left.pushToTalkMode === right.pushToTalkMode &&
     left.pushToTalkKey === right.pushToTalkKey
+  );
+}
+
+function videoSettingsEqual(left: GaiaVideoSettings, right: GaiaVideoSettings): boolean {
+  return (
+    left.cameraDeviceId === right.cameraDeviceId &&
+    left.cameraResolution === right.cameraResolution &&
+    left.cameraFrameRate === right.cameraFrameRate &&
+    left.mirrorPreview === right.mirrorPreview
   );
 }
 
@@ -2724,16 +2758,28 @@ function createSettingsRange(
   return control;
 }
 
-function defaultDeviceChoice(kind: AudioDeviceChoice['kind']): AudioDeviceChoice {
+function defaultDeviceChoice<K extends MediaDeviceChoiceKind>(kind: K): K extends 'videoinput' ? VideoDeviceChoice : AudioDeviceChoice {
+  const label =
+    kind === 'audioinput'
+      ? 'System default microphone'
+      : kind === 'audiooutput'
+        ? 'System default speakers'
+        : 'System default camera';
   return {
     deviceId: 'default',
-    label: kind === 'audioinput' ? 'System default microphone' : 'System default speakers',
+    label,
     kind,
-  };
+  } as K extends 'videoinput' ? VideoDeviceChoice : AudioDeviceChoice;
 }
 
-function formatDeviceFallbackLabel(kind: AudioDeviceChoice['kind'], index: number): string {
-  return kind === 'audioinput' ? `Microphone ${index + 1}` : `Speakers ${index + 1}`;
+function formatDeviceFallbackLabel(kind: MediaDeviceChoiceKind, index: number): string {
+  if (kind === 'audioinput') {
+    return `Microphone ${index + 1}`;
+  }
+  if (kind === 'videoinput') {
+    return `Camera ${index + 1}`;
+  }
+  return `Speakers ${index + 1}`;
 }
 
 function toAudioDeviceChoices(devices: MediaDeviceInfo[], kind: AudioDeviceChoice['kind']): AudioDeviceChoice[] {
@@ -2744,6 +2790,18 @@ function toAudioDeviceChoices(devices: MediaDeviceInfo[], kind: AudioDeviceChoic
       deviceId: device.deviceId,
       label: device.label || formatDeviceFallbackLabel(kind, index),
       kind,
+    })),
+  ];
+}
+
+function toVideoDeviceChoices(devices: MediaDeviceInfo[]): VideoDeviceChoice[] {
+  const filtered = devices.filter((device) => device.kind === 'videoinput' && device.deviceId && device.deviceId !== 'default');
+  return [
+    defaultDeviceChoice('videoinput'),
+    ...filtered.map((device, index) => ({
+      deviceId: device.deviceId,
+      label: device.label || formatDeviceFallbackLabel('videoinput', index),
+      kind: 'videoinput' as const,
     })),
   ];
 }
@@ -2763,6 +2821,21 @@ function withSavedDeviceChoice(
       deviceId,
       label: kind === 'audioinput' ? 'Saved microphone' : 'Saved speakers',
       kind,
+    },
+  ];
+}
+
+function withSavedVideoDeviceChoice(devices: VideoDeviceChoice[], deviceId: string): VideoDeviceChoice[] {
+  const baseDevices = devices.length > 0 ? devices : [defaultDeviceChoice('videoinput')];
+  if (!deviceId || baseDevices.some((device) => device.deviceId === deviceId)) {
+    return baseDevices;
+  }
+  return [
+    ...baseDevices,
+    {
+      deviceId,
+      label: 'Saved camera',
+      kind: 'videoinput',
     },
   ];
 }
@@ -2808,34 +2881,40 @@ async function repairMissingOutputDevice(): Promise<void> {
 async function refreshAudioDevices(requestPermission = false): Promise<void> {
   if (!navigator.mediaDevices?.enumerateDevices) {
     audioDeviceLoadState = 'failed';
-    audioDeviceMessage = 'Audio devices are unavailable in this renderer.';
+    audioDeviceMessage = 'Media devices are unavailable in this renderer.';
     renderSettingsWorkspace();
     return;
   }
 
   audioDeviceLoadState = 'loading';
-  audioDeviceMessage = requestPermission ? 'Requesting microphone access...' : 'Scanning audio devices...';
+  audioDeviceMessage = requestPermission ? 'Requesting device access...' : 'Scanning media devices...';
   renderSettingsWorkspace();
 
   let stream: MediaStream | undefined;
   try {
     if (requestPermission && navigator.mediaDevices.getUserMedia) {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(async () =>
+        navigator.mediaDevices.getUserMedia({ audio: true, video: false }).catch(() =>
+          navigator.mediaDevices.getUserMedia({ audio: false, video: true }),
+        ),
+      );
     }
     const devices = await navigator.mediaDevices.enumerateDevices();
     audioInputDevices = toAudioDeviceChoices(devices, 'audioinput');
     audioOutputDevices = toAudioDeviceChoices(devices, 'audiooutput');
+    videoInputDevices = toVideoDeviceChoices(devices);
     await repairMissingOutputDevice();
     audioDeviceLoadState = 'ready';
     audioDeviceMessage =
       devices.some((device) => device.label)
-        ? 'Audio devices are ready.'
-        : 'Device names may appear after microphone access is allowed.';
+        ? 'Media devices are ready.'
+        : 'Device names may appear after access is allowed.';
   } catch (error) {
     audioDeviceLoadState = 'failed';
-    audioDeviceMessage = error instanceof Error ? error.message : 'Could not read audio devices.';
+    audioDeviceMessage = error instanceof Error ? error.message : 'Could not read media devices.';
     audioInputDevices = [defaultDeviceChoice('audioinput')];
     audioOutputDevices = [defaultDeviceChoice('audiooutput')];
+    videoInputDevices = [defaultDeviceChoice('videoinput')];
   } finally {
     for (const track of stream?.getTracks() ?? []) {
       track.stop();
@@ -2995,6 +3074,92 @@ async function startMicrophoneTest(): Promise<void> {
     microphoneTestState = 'failed';
     microphoneTestMessage = error instanceof Error ? error.message : 'Could not start microphone test.';
     setMicrophoneTestLevel(0);
+    renderSettingsWorkspace();
+  }
+}
+
+function cameraResolutionSize(resolution: GaiaVideoSettings['cameraResolution']): { width: number; height: number } {
+  if (resolution === '1080p') {
+    return { width: 1920, height: 1080 };
+  }
+  if (resolution === '480p') {
+    return { width: 854, height: 480 };
+  }
+  return { width: 1280, height: 720 };
+}
+
+function createCameraPreviewConstraints(video: GaiaVideoSettings, includeDevice: boolean): MediaTrackConstraints {
+  const size = cameraResolutionSize(video.cameraResolution);
+  const constraints: MediaTrackConstraints = {
+    width: { ideal: size.width },
+    height: { ideal: size.height },
+    frameRate: { ideal: video.cameraFrameRate, max: Math.max(1, Math.min(60, video.cameraFrameRate)) },
+  };
+
+  if (includeDevice && video.cameraDeviceId && video.cameraDeviceId !== 'default') {
+    constraints.deviceId = { exact: video.cameraDeviceId };
+  }
+
+  return constraints;
+}
+
+function stopCameraPreview(options: { render?: boolean } = {}): void {
+  const runtime = cameraPreviewRuntime;
+  if (runtime) {
+    for (const track of runtime.stream.getTracks()) {
+      track.stop();
+    }
+  }
+
+  cameraPreviewRuntime = null;
+  cameraPreviewState = 'idle';
+  cameraPreviewMessage = 'Start a camera preview to check your selected webcam.';
+
+  if (options.render !== false) {
+    renderSettingsWorkspace();
+  }
+}
+
+async function startCameraPreview(): Promise<void> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    cameraPreviewState = 'failed';
+    cameraPreviewMessage = 'Camera capture is unavailable in this renderer.';
+    renderSettingsWorkspace();
+    return;
+  }
+
+  stopCameraPreview({ render: false });
+  cameraPreviewState = 'starting';
+  cameraPreviewMessage = 'Requesting camera...';
+  renderSettingsWorkspace();
+
+  const video = (settingsDraft ?? currentSettings()).video;
+  try {
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: createCameraPreviewConstraints(video, true),
+      });
+    } catch (error) {
+      if (video.cameraDeviceId === 'default' || !isAudioDeviceSelectionError(error)) {
+        throw error;
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: createCameraPreviewConstraints(video, false),
+      });
+    }
+
+    cameraPreviewRuntime = { stream };
+    cameraPreviewState = 'active';
+    cameraPreviewMessage = 'Previewing the selected camera locally.';
+    await refreshAudioDevices(false);
+    renderSettingsWorkspace();
+  } catch (error) {
+    cameraPreviewRuntime = null;
+    cameraPreviewState = 'failed';
+    cameraPreviewMessage = error instanceof Error ? error.message : 'Could not start camera preview.';
     renderSettingsWorkspace();
   }
 }
@@ -3411,6 +3576,52 @@ function createMicrophoneTestControl(): HTMLElement {
   return control;
 }
 
+function createCameraPreviewControl(videoSettings: GaiaVideoSettings): HTMLElement {
+  const control = document.createElement('div');
+  control.className = 'camera-preview-control';
+
+  const preview = document.createElement('div');
+  preview.className = 'camera-preview-frame';
+  preview.dataset.state = cameraPreviewState;
+
+  const video = document.createElement('video');
+  video.autoplay = true;
+  video.muted = true;
+  video.playsInline = true;
+  video.classList.toggle('mirrored', videoSettings.mirrorPreview);
+  if (cameraPreviewRuntime?.stream) {
+    video.srcObject = cameraPreviewRuntime.stream;
+  }
+
+  const placeholder = document.createElement('span');
+  placeholder.textContent =
+    cameraPreviewState === 'starting'
+      ? 'Starting...'
+      : cameraPreviewState === 'failed'
+        ? 'Preview unavailable'
+        : 'Camera preview';
+  preview.append(video, placeholder);
+
+  const button = createSettingsAction(
+    cameraPreviewState === 'active'
+      ? 'Stop preview'
+      : cameraPreviewState === 'starting'
+        ? 'Starting...'
+        : 'Start preview',
+    () => {
+      if (cameraPreviewState === 'active') {
+        stopCameraPreview();
+        return;
+      }
+      void startCameraPreview();
+    },
+    cameraPreviewState === 'starting',
+  );
+
+  control.append(preview, createSettingsActionGroup(button));
+  return control;
+}
+
 function formatVolumeLabel(value: number): string {
   return `${Math.round(Math.min(1, Math.max(0, value)) * 100)}%`;
 }
@@ -3478,6 +3689,24 @@ function updateSoundSettingsDraft(patch: Partial<GaiaSoundSettings>): void {
   updateSettingsDraft({
     sound: {
       ...draft.sound,
+      ...patch,
+    },
+  });
+}
+
+function updateVideoSettingsDraft(patch: Partial<GaiaVideoSettings>): void {
+  if (
+    cameraPreviewState === 'active' &&
+    (patch.cameraDeviceId ||
+      patch.cameraResolution ||
+      typeof patch.cameraFrameRate === 'number')
+  ) {
+    stopCameraPreview({ render: false });
+  }
+  const draft = settingsDraft ?? cloneSettings(currentSettings());
+  updateSettingsDraft({
+    video: {
+      ...draft.video,
       ...patch,
     },
   });
@@ -3648,11 +3877,13 @@ function renderSoundSettings(draft: GaiaSettings): DocumentFragment {
   ensureAudioDevicesLoaded();
   const fragment = document.createDocumentFragment();
   const sound = draft.sound;
+  const video = draft.video;
   const inputDevices = withSavedDeviceChoice(audioInputDevices, sound.inputDeviceId, 'audioinput');
   const outputDevices = withSavedDeviceChoice(audioOutputDevices, sound.outputDeviceId, 'audiooutput');
+  const cameraDevices = withSavedVideoDeviceChoice(videoInputDevices, video.cameraDeviceId);
   const devicesLoading = audioDeviceLoadState === 'loading';
 
-  const devicesCard = createSettingsCard('Devices', 'Choose the microphone and speakers used by Current voice.');
+  const devicesCard = createSettingsCard('Audio Devices', 'Choose the microphone and speakers used by Current voice.');
   appendSettingsRow(
     devicesCard,
     'Microphone',
@@ -3678,13 +3909,73 @@ function renderSoundSettings(draft: GaiaSettings): DocumentFragment {
   appendSettingsRow(
     devicesCard,
     'Device list',
-    audioDeviceMessage || 'Scan for connected audio devices.',
+    audioDeviceMessage || 'Scan for connected media devices.',
     createSettingsActionGroup(
       createSettingsAction('Refresh', () => void refreshAudioDevices(false), devicesLoading),
       createSettingsAction('Allow labels', () => void refreshAudioDevices(true), devicesLoading),
     ),
   );
   fragment.append(devicesCard);
+
+  const videoCard = createSettingsCard('Video', 'Choose the camera used for Current lounge webcam sharing.');
+  appendSettingsRow(
+    videoCard,
+    'Camera',
+    'Input device for webcam sharing.',
+    createSettingsSelect(
+      'Camera device',
+      cameraDevices.map((device) => ({ value: device.deviceId, label: device.label })),
+      video.cameraDeviceId,
+      (cameraDeviceId) => updateVideoSettingsDraft({ cameraDeviceId }),
+    ),
+  );
+  appendSettingsRow(
+    videoCard,
+    'Resolution',
+    'Preview and sharing prefer this size, subject to server limits.',
+    createSegmentedControl<GaiaVideoSettings['cameraResolution']>(
+      'Camera resolution',
+      [
+        { value: '480p', label: '480p' },
+        { value: '720p', label: '720p' },
+        { value: '1080p', label: '1080p' },
+      ],
+      video.cameraResolution,
+      (cameraResolution) => updateVideoSettingsDraft({ cameraResolution }),
+    ),
+  );
+  appendSettingsRow(
+    videoCard,
+    'Frame rate',
+    'Lower values are easier on small servers and laptops.',
+    createSegmentedControl<'15' | '30' | '60'>(
+      'Camera frame rate',
+      [
+        { value: '15', label: '15' },
+        { value: '30', label: '30' },
+        { value: '60', label: '60' },
+      ],
+      video.cameraFrameRate === 15 || video.cameraFrameRate === 60
+        ? (String(video.cameraFrameRate) as '15' | '60')
+        : '30',
+      (cameraFrameRate) => updateVideoSettingsDraft({ cameraFrameRate: Number(cameraFrameRate) }),
+    ),
+  );
+  appendSettingsRow(
+    videoCard,
+    'Mirror preview',
+    'Applies to your local preview only.',
+    createSettingsToggle('Mirror camera preview', video.mirrorPreview, (mirrorPreview) =>
+      updateVideoSettingsDraft({ mirrorPreview }),
+    ),
+  );
+  appendSettingsRow(
+    videoCard,
+    'Preview',
+    cameraPreviewMessage,
+    createCameraPreviewControl(video),
+  );
+  fragment.append(videoCard);
 
   const testCard = createSettingsCard('Microphone Test', 'Check the selected input without joining a voice channel.');
   appendSettingsRow(
@@ -3907,6 +4198,7 @@ function renderSettingsWorkspace(): void {
       soundKeyCaptureActive = false;
       if (activeSettingsSection === 'sound' && section.id !== 'sound') {
         stopMicrophoneTest({ render: false });
+        stopCameraPreview({ render: false });
       }
       activeSettingsSection = section.id;
       renderSettingsWorkspace();
@@ -3990,6 +4282,9 @@ function settingsPatchForSave(draft: GaiaSettings): GaiaSettingsPatch {
   if (!soundSettingsEqual(draft.sound, current.sound)) {
     patch.sound = { ...draft.sound };
   }
+  if (!videoSettingsEqual(draft.video, current.video)) {
+    patch.video = { ...draft.video };
+  }
 
   return patch;
 }
@@ -4010,6 +4305,7 @@ async function saveSettingsDraft(): Promise<void> {
 
   settingsDraft = draft;
   soundKeyCaptureActive = false;
+  stopCameraPreview({ render: false });
   settingsSaveInFlight = true;
   renderSettingsWorkspace();
   try {
@@ -4030,6 +4326,7 @@ async function saveSettingsDraft(): Promise<void> {
 function resetSettingsDraft(): void {
   soundKeyCaptureActive = false;
   stopMicrophoneTest({ render: false });
+  stopCameraPreview({ render: false });
   settingsDraft = cloneSettings(currentSettings());
   applyAppearanceMode(settingsDraft);
   applyAccentColor(settingsDraft);
@@ -6026,6 +6323,7 @@ function switchToSettingsView(options: { section?: SettingsSectionId; clearSearc
     soundKeyCaptureActive = false;
     if (activeSettingsSection === 'sound' && options.section !== 'sound') {
       stopMicrophoneTest({ render: false });
+      stopCameraPreview({ render: false });
     }
     activeSettingsSection = options.section;
   }
@@ -6040,6 +6338,7 @@ function switchToSettingsView(options: { section?: SettingsSectionId; clearSearc
 function closeSettingsView(): void {
   soundKeyCaptureActive = false;
   stopMicrophoneTest({ render: false });
+  stopCameraPreview({ render: false });
   if (lastContentView === 'messages') {
     switchToMessagesView({ remember: false });
     return;
@@ -6114,6 +6413,7 @@ async function switchAppearanceModeFromRail(appearanceMode: GaiaAppearanceMode):
         ...previousDraft,
         appearanceMode,
         sound: { ...previousDraft.sound },
+        video: { ...previousDraft.video },
       };
     } else {
       settingsDraft = activeView === 'settings' ? cloneSettings(store.settings) : null;
