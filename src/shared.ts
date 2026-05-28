@@ -19,6 +19,23 @@ export type GaiaAppearanceMode = 'auto' | 'light' | 'dark';
 export type GaiaResolvedAppearanceMode = 'light' | 'dark';
 export type GaiaPushToTalkMode = 'voice_activity' | 'hold' | 'toggle';
 export type GaiaCameraResolution = '480p' | '720p' | '1080p';
+export type GaiaServerNotificationLevel = 'all' | 'mentions' | 'nothing';
+
+export const GAIA_P2P_VOICE_DEFAULT_STUN_URLS = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+  'stun:stun2.l.google.com:19302',
+] as const;
+
+export interface GaiaServerNotificationSetting {
+  level: GaiaServerNotificationLevel;
+  mutedUntil?: string;
+}
+
+export interface GaiaServerNotificationSettingsPatch {
+  level?: GaiaServerNotificationLevel;
+  mutedUntil?: string | null;
+}
 
 export interface GaiaAppearanceModePayload {
   mode: GaiaAppearanceMode;
@@ -48,6 +65,22 @@ export interface GaiaVideoSettings {
   mirrorPreview: boolean;
 }
 
+export interface GaiaP2PVoiceTurnServer {
+  turnUrl?: string;
+  turnsUrl?: string;
+  username?: string;
+  credential?: string;
+}
+
+export interface GaiaP2PVoiceSettings {
+  turnServers: GaiaP2PVoiceTurnServer[];
+}
+
+export interface GaiaP2PVoiceIceConfig {
+  stunUrls: string[];
+  turnServers: GaiaP2PVoiceTurnServer[];
+}
+
 export interface GaiaSettings {
   startupView: GaiaStartupView;
   lastContentView: GaiaLastContentView;
@@ -61,15 +94,73 @@ export interface GaiaSettings {
   perfProbe: boolean;
   sound: GaiaSoundSettings;
   video: GaiaVideoSettings;
+  p2pVoice: GaiaP2PVoiceSettings;
 }
 
 export type GaiaSettingsPatch = Partial<GaiaSettings>;
+
+export type GaiaP2PVoiceSignalType =
+  | 'offer'
+  | 'answer'
+  | 'ice-candidate'
+  | 'join-call'
+  | 'leave-call'
+  | 'call-rejected'
+  | 'call-ended';
+
+export interface GaiaP2PVoiceSessionDescription {
+  type: 'offer' | 'answer';
+  sdp: string;
+}
+
+export interface GaiaP2PVoiceIceCandidate {
+  candidate: string;
+  sdpMid?: string | null;
+  sdpMLineIndex?: number | null;
+  usernameFragment?: string | null;
+}
+
+export interface GaiaP2PVoiceSignalBase {
+  version: 1;
+  type: GaiaP2PVoiceSignalType;
+  callId: string;
+  roomId: string;
+  senderId: string;
+  createdAt: string;
+}
+
+export interface GaiaP2PVoiceOfferSignal extends GaiaP2PVoiceSignalBase {
+  type: 'offer';
+  description: GaiaP2PVoiceSessionDescription;
+}
+
+export interface GaiaP2PVoiceAnswerSignal extends GaiaP2PVoiceSignalBase {
+  type: 'answer';
+  description: GaiaP2PVoiceSessionDescription;
+}
+
+export interface GaiaP2PVoiceIceCandidateSignal extends GaiaP2PVoiceSignalBase {
+  type: 'ice-candidate';
+  candidate: GaiaP2PVoiceIceCandidate;
+}
+
+export interface GaiaP2PVoiceControlSignal extends GaiaP2PVoiceSignalBase {
+  type: 'join-call' | 'leave-call' | 'call-rejected' | 'call-ended';
+  reason?: string;
+}
+
+export type GaiaP2PVoiceSignalMessage =
+  | GaiaP2PVoiceOfferSignal
+  | GaiaP2PVoiceAnswerSignal
+  | GaiaP2PVoiceIceCandidateSignal
+  | GaiaP2PVoiceControlSignal;
 
 export interface GaiaStore {
   version: 1;
   selectedServerId?: string;
   identity: GaiaIdentity | null;
   servers: GaiaServer[];
+  serverNotificationSettings: Record<string, GaiaServerNotificationSetting>;
   settings: GaiaSettings;
 }
 
@@ -136,6 +227,7 @@ export interface GaiaNotification {
   authorAvatarUrl?: string;
   title: string;
   body: string;
+  messagePreview?: string;
   createdAt: string;
   readAt?: string;
 }
@@ -231,6 +323,43 @@ export interface GaiaServerClientAuthResult {
   ok: boolean;
   message: string;
   oauth?: GaiaOAuthStartResponse;
+}
+
+export interface GaiaSpotifyActivity {
+  provider: 'spotify';
+  title: string;
+  artists: string[];
+  album?: string;
+  albumArtUrl?: string;
+  trackUrl?: string;
+  isPlaying: boolean;
+  progressMs?: number;
+  durationMs?: number;
+  startedAt?: string;
+  updatedAt: string;
+  expiresAt: string;
+}
+
+export interface GaiaSpotifyStatus {
+  configured: boolean;
+  connected: boolean;
+  sharingEnabled: boolean;
+  redirectUri: string;
+  scope: string;
+  expiresAt?: string;
+  displayName?: string;
+  activity?: GaiaSpotifyActivity;
+  message?: string;
+}
+
+export interface GaiaSpotifyAuthStartResponse {
+  openedExternal: boolean;
+  authorizationUrl?: string;
+  redirectUri: string;
+}
+
+export interface GaiaSpotifySharingPatch {
+  sharingEnabled?: boolean;
 }
 
 export interface GaiaBskyActor {

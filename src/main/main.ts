@@ -23,7 +23,7 @@ import type {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { isIP, type AddressInfo } from 'node:net';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -57,13 +57,22 @@ import type {
   GaiaNotificationKind,
   GaiaOAuthStartRequest,
   GaiaOAuthStartResponse,
+  GaiaP2PVoiceSettings,
+  GaiaP2PVoiceTurnServer,
   GaiaServerClientAuthResult,
   GaiaServer,
   GaiaServerInput,
+  GaiaServerNotificationLevel,
+  GaiaServerNotificationSetting,
+  GaiaServerNotificationSettingsPatch,
   GaiaServerProbe,
   GaiaSettings,
   GaiaSettingsPatch,
   GaiaSoundSettings,
+  GaiaSpotifyActivity,
+  GaiaSpotifyAuthStartResponse,
+  GaiaSpotifySharingPatch,
+  GaiaSpotifyStatus,
   GaiaStore,
   GaiaGifResult,
   GaiaGifSearchRequest,
@@ -98,10 +107,18 @@ const STORE_VERSION = 1;
 const DEFAULT_AUTH_HANDLE = 'https://bsky.social';
 const AUTH_CALLBACK_PATH = '/current/oauth/callback';
 const BSKY_CALLBACK_PATH = '/bluesky/oauth/callback';
+const SPOTIFY_CALLBACK_PATH = '/spotify/oauth/callback';
 const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
 const BSKY_AUTH_SCOPE = 'atproto transition:generic transition:chat.bsky';
 const BSKY_CHAT_PROXY = 'did:web:api.bsky.chat#bsky_chat';
 const BSKY_STATE_TTL_MS = 60 * 60 * 1000;
+const SPOTIFY_CLIENT_ID = process.env.GAIA_SPOTIFY_CLIENT_ID?.trim() || '66d50f82108549d4a7a5c25d8c88eb40';
+const SPOTIFY_REDIRECT_URI =
+  process.env.GAIA_SPOTIFY_REDIRECT_URI?.trim() || 'https://gaiachat.github.io/spotify/callback/';
+const SPOTIFY_AUTH_SCOPE = 'user-read-currently-playing';
+const SPOTIFY_STATE_TTL_MS = 10 * 60 * 1000;
+const SPOTIFY_POLL_INTERVAL_MS = 15_000;
+const SPOTIFY_ACTIVITY_EXPIRES_MS = 90_000;
 const DEFAULT_CALLBACK_PORT = Number(process.env.GAIA_CALLBACK_PORT ?? 17321);
 const CURRENT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_ACCENT_COLOR = '#30b4ff';
@@ -477,6 +494,9 @@ let bskyOAuthClient: NodeOAuthClientType | null = null;
 let bskyOAuthClientCallbackUrl: string | null = null;
 let usageHeartbeatTimer: NodeJS.Timeout | null = null;
 let usageClientIdPromise: Promise<string> | null = null;
+let spotifySharingTimer: NodeJS.Timeout | null = null;
+let spotifySharingInFlight = false;
+let lastSpotifyActivitySignature: string | null = null;
 const currentWebviewContents = new Set<WebContents>();
 const avatarCacheInFlight = new Map<string, Promise<string>>();
 const avatarCacheExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif'];
@@ -514,6 +534,36 @@ interface GaiaNotificationStore {
   version: 1;
   notifications: GaiaNotification[];
   currentLastSeqByServerId: Record<string, number>;
+}
+
+interface SpotifyPendingState {
+  codeVerifier: string;
+  createdAt: number;
+}
+
+interface SpotifyTokenRecord {
+  accessToken: string;
+  refreshToken?: string;
+  tokenType: string;
+  scope?: string;
+  expiresAt: string;
+}
+
+interface SpotifyAuthStore {
+  version: 1;
+  sharingEnabled: boolean;
+  states: Record<string, SpotifyPendingState>;
+  token?: SpotifyTokenRecord;
+  displayName?: string;
+  lastActivity?: GaiaSpotifyActivity;
+}
+
+interface SpotifyTokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  token_type?: string;
+  scope?: string;
+  expires_in?: number;
 }
 
 interface CurrentUserPayload {
@@ -648,6 +698,7 @@ interface CurrentNotificationWatcher {
   origin: string;
   sessionToken: string;
   lastSeq: number;
+  serverNotificationSetting: GaiaServerNotificationSetting;
   currentUser?: CurrentUserPayload;
   currentServer?: CurrentServerPayload;
   channels: Map<string, string>;
@@ -1089,6 +1140,7 @@ function defaultStore(): GaiaStore {
         updatedAt: createdAt,
       },
     ],
+    serverNotificationSettings: {},
     settings: defaultSettings(),
   };
 }
@@ -1107,6 +1159,34 @@ function defaultSettings(): GaiaSettings {
     perfProbe: false,
     sound: defaultSoundSettings(),
     video: defaultVideoSettings(),
+    p2pVoice: defaultP2PVoiceSettings(),
+  };
+}
+
+function defaultServerNotificationSetting(): GaiaServerNotificationSetting {
+  return {
+    level: 'all',
+  };
+}
+
+function coerceServerNotificationLevel(value: unknown): GaiaServerNotificationLevel {
+  return value === 'all' || value === 'mentions' || value === 'nothing'
+    ? value
+    : defaultServerNotificationSetting().level;
+}
+
+function coerceServerNotificationSetting(
+  raw: Partial<GaiaServerNotificationSetting> | undefined | null,
+): GaiaServerNotificationSetting {
+  const fallback = defaultServerNotificationSetting();
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  const mutedUntil = typeof raw.mutedUntil === 'string' ? raw.mutedUntil : undefined;
+  return {
+    level: coerceServerNotificationLevel(raw.level),
+    ...(mutedUntil ? { mutedUntil } : {}),
   };
 }
 
@@ -1129,6 +1209,12 @@ function defaultVideoSettings(): GaiaVideoSettings {
     cameraResolution: '720p',
     cameraFrameRate: 30,
     mirrorPreview: true,
+  };
+}
+
+function defaultP2PVoiceSettings(): GaiaP2PVoiceSettings {
+  return {
+    turnServers: [],
   };
 }
 
@@ -1215,6 +1301,10 @@ function currentSessionStorePath(): string {
 
 function notificationStorePath(): string {
   return join(app.getPath('userData'), 'notifications.json');
+}
+
+function spotifyAuthStorePath(): string {
+  return join(app.getPath('userData'), 'spotify-auth.json');
 }
 
 function uniqueTempPath(path: string): string {
@@ -1435,6 +1525,7 @@ function coerceNotificationStore(raw: Partial<GaiaNotificationStore> | null): Ga
           authorHandle: typeof notification.authorHandle === 'string' ? notification.authorHandle : undefined,
           authorAvatarUrl:
             typeof notification.authorAvatarUrl === 'string' ? notification.authorAvatarUrl : undefined,
+          messagePreview: typeof notification.messagePreview === 'string' ? notification.messagePreview : undefined,
           readAt: typeof notification.readAt === 'string' ? notification.readAt : undefined,
         }))
         .slice(0, MAX_NOTIFICATION_HISTORY)
@@ -1531,10 +1622,12 @@ function showCurrentDesktopNotification(notification: GaiaNotification): void {
     return;
   }
 
+  const iconPath = notificationIconPath(notification);
+  const title = currentDesktopNotificationTitle(notification);
   const toast = new Notification({
-    title: `${notification.serverName}: ${notification.title}`,
-    body: notification.body,
-    ...(gaiaAppIconPath() ? { icon: gaiaAppIconPath() } : {}),
+    title,
+    body: notification.messagePreview?.trim() || notification.body,
+    ...(iconPath ? { icon: iconPath } : {}),
   });
   toast.on('click', () => {
     if (!mainWindow || mainWindow.isDestroyed()) {
@@ -1547,6 +1640,25 @@ function showCurrentDesktopNotification(notification: GaiaNotification): void {
     mainWindow?.focus();
   });
   toast.show();
+}
+
+function notificationIconPath(notification: GaiaNotification): string | undefined {
+  if (notification.authorAvatarUrl?.startsWith('file:')) {
+    try {
+      const avatarPath = fileURLToPath(notification.authorAvatarUrl);
+      if (existsSync(avatarPath)) {
+        return avatarPath;
+      }
+    } catch {
+      // Fall back to the app icon.
+    }
+  }
+  return gaiaAppIconPath();
+}
+
+function currentDesktopNotificationTitle(notification: GaiaNotification): string {
+  const channelCopy = notification.channelName ? ` in #${notification.channelName}` : '';
+  return `${notification.authorName}${channelCopy} - ${notification.serverName}`;
 }
 
 async function addCurrentNotification(
@@ -1634,6 +1746,154 @@ async function clearNotifications(): Promise<GaiaNotificationCenterState> {
   return toNotificationCenterState(next);
 }
 
+function defaultSpotifyAuthStore(): SpotifyAuthStore {
+  return {
+    version: 1,
+    sharingEnabled: false,
+    states: {},
+  };
+}
+
+function coerceSpotifyAuthStore(raw: Partial<SpotifyAuthStore> | null): SpotifyAuthStore {
+  const fallback = defaultSpotifyAuthStore();
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+
+  const now = Date.now();
+  const states: Record<string, SpotifyPendingState> = {};
+  if (raw.states && typeof raw.states === 'object') {
+    for (const [state, entry] of Object.entries(raw.states)) {
+      if (
+        entry &&
+        typeof entry === 'object' &&
+        typeof entry.codeVerifier === 'string' &&
+        typeof entry.createdAt === 'number' &&
+        now - entry.createdAt < SPOTIFY_STATE_TTL_MS
+      ) {
+        states[state] = {
+          codeVerifier: entry.codeVerifier,
+          createdAt: entry.createdAt,
+        };
+      }
+    }
+  }
+
+  let token: SpotifyTokenRecord | undefined;
+  if (
+    raw.token &&
+    typeof raw.token === 'object' &&
+    typeof raw.token.accessToken === 'string' &&
+    typeof raw.token.tokenType === 'string' &&
+    typeof raw.token.expiresAt === 'string'
+  ) {
+    token = {
+      accessToken: raw.token.accessToken,
+      refreshToken: typeof raw.token.refreshToken === 'string' ? raw.token.refreshToken : undefined,
+      tokenType: raw.token.tokenType,
+      scope: typeof raw.token.scope === 'string' ? raw.token.scope : undefined,
+      expiresAt: raw.token.expiresAt,
+    };
+  }
+
+  return {
+    version: 1,
+    sharingEnabled: typeof raw.sharingEnabled === 'boolean' ? raw.sharingEnabled : fallback.sharingEnabled,
+    states,
+    token,
+    displayName: typeof raw.displayName === 'string' ? raw.displayName : undefined,
+    lastActivity: coerceSpotifyActivity(raw.lastActivity),
+  };
+}
+
+function coerceSpotifyActivity(raw: unknown): GaiaSpotifyActivity | undefined {
+  if (!raw || typeof raw !== 'object') {
+    return undefined;
+  }
+  const activity = raw as Partial<GaiaSpotifyActivity>;
+  if (
+    activity.provider !== 'spotify' ||
+    typeof activity.title !== 'string' ||
+    !Array.isArray(activity.artists) ||
+    typeof activity.isPlaying !== 'boolean' ||
+    typeof activity.updatedAt !== 'string' ||
+    typeof activity.expiresAt !== 'string'
+  ) {
+    return undefined;
+  }
+
+  return {
+    provider: 'spotify',
+    title: activity.title,
+    artists: activity.artists.filter((artist): artist is string => typeof artist === 'string'),
+    album: typeof activity.album === 'string' ? activity.album : undefined,
+    albumArtUrl: typeof activity.albumArtUrl === 'string' ? activity.albumArtUrl : undefined,
+    trackUrl: typeof activity.trackUrl === 'string' ? activity.trackUrl : undefined,
+    isPlaying: activity.isPlaying,
+    progressMs: typeof activity.progressMs === 'number' ? activity.progressMs : undefined,
+    durationMs: typeof activity.durationMs === 'number' ? activity.durationMs : undefined,
+    startedAt: typeof activity.startedAt === 'string' ? activity.startedAt : undefined,
+    updatedAt: activity.updatedAt,
+    expiresAt: activity.expiresAt,
+  };
+}
+
+async function readSpotifyAuthStore(): Promise<SpotifyAuthStore> {
+  try {
+    const contents = await readFile(spotifyAuthStorePath(), 'utf8');
+    return coerceSpotifyAuthStore(JSON.parse(contents) as Partial<SpotifyAuthStore>);
+  } catch {
+    return defaultSpotifyAuthStore();
+  }
+}
+
+async function saveSpotifyAuthStore(store: SpotifyAuthStore): Promise<SpotifyAuthStore> {
+  const path = spotifyAuthStorePath();
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = uniqueTempPath(path);
+  const normalized = coerceSpotifyAuthStore(store);
+  await writeFile(tempPath, `${JSON.stringify(normalized, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  await rename(tempPath, path);
+  return normalized;
+}
+
+async function mutateSpotifyAuthStore(mutator: (store: SpotifyAuthStore) => SpotifyAuthStore): Promise<SpotifyAuthStore> {
+  const current = await readSpotifyAuthStore();
+  return saveSpotifyAuthStore(mutator(current));
+}
+
+function spotifyStatusFromStore(store: SpotifyAuthStore, message?: string): GaiaSpotifyStatus {
+  const tokenExpiresAt = store.token?.expiresAt;
+  const activeActivity =
+    store.lastActivity && Date.parse(store.lastActivity.expiresAt) > Date.now()
+      ? store.lastActivity
+      : undefined;
+  return {
+    configured: SPOTIFY_CLIENT_ID.length > 0,
+    connected: Boolean(store.token),
+    sharingEnabled: store.sharingEnabled,
+    redirectUri: SPOTIFY_REDIRECT_URI,
+    scope: SPOTIFY_AUTH_SCOPE,
+    expiresAt: tokenExpiresAt,
+    displayName: store.displayName,
+    activity: activeActivity,
+    message,
+  };
+}
+
+async function getSpotifyStatus(message?: string): Promise<GaiaSpotifyStatus> {
+  return spotifyStatusFromStore(await readSpotifyAuthStore(), message);
+}
+
+async function broadcastSpotifyStatus(message?: string): Promise<GaiaSpotifyStatus> {
+  const status = await getSpotifyStatus(message);
+  mainWindow?.webContents.send('gaia:spotify:changed', status);
+  return status;
+}
+
 function coerceStore(raw: Partial<GaiaStore> | null): GaiaStore {
   const fallback = defaultStore();
   if (!raw || typeof raw !== 'object') {
@@ -1677,6 +1937,18 @@ function coerceStore(raw: Partial<GaiaStore> | null): GaiaStore {
     }
   }
 
+  const serverIds = new Set(servers.map((server) => server.id));
+  const serverNotificationSettings: Record<string, GaiaServerNotificationSetting> = {};
+  if (raw.serverNotificationSettings && typeof raw.serverNotificationSettings === 'object') {
+    for (const [serverId, setting] of Object.entries(raw.serverNotificationSettings)) {
+      if (serverIds.has(serverId) && setting && typeof setting === 'object') {
+        serverNotificationSettings[serverId] = coerceServerNotificationSetting(
+          setting as Partial<GaiaServerNotificationSetting>,
+        );
+      }
+    }
+  }
+
   return {
     version: STORE_VERSION,
     selectedServerId:
@@ -1685,6 +1957,7 @@ function coerceStore(raw: Partial<GaiaStore> | null): GaiaStore {
         : servers[0]?.id,
     identity,
     servers: servers.length > 0 ? servers : fallback.servers,
+    serverNotificationSettings,
     settings: coerceSettings(raw.settings),
   };
 }
@@ -1726,6 +1999,7 @@ function coerceSettings(raw: Partial<GaiaSettings> | undefined | null): GaiaSett
     perfProbe: typeof raw.perfProbe === 'boolean' ? raw.perfProbe : fallback.perfProbe,
     sound: coerceSoundSettings(raw.sound),
     video: coerceVideoSettings(raw.video),
+    p2pVoice: coerceP2PVoiceSettings(raw.p2pVoice),
   };
 }
 
@@ -1788,6 +2062,34 @@ function coerceVideoSettings(raw: Partial<GaiaVideoSettings> | undefined | null)
         : fallback.cameraResolution,
     cameraFrameRate: Math.round(clampNumber(raw.cameraFrameRate, fallback.cameraFrameRate, 1, 60)),
     mirrorPreview: typeof raw.mirrorPreview === 'boolean' ? raw.mirrorPreview : fallback.mirrorPreview,
+  };
+}
+
+function coerceP2PVoiceSettings(raw: Partial<GaiaP2PVoiceSettings> | undefined | null): GaiaP2PVoiceSettings {
+  const fallback = defaultP2PVoiceSettings();
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.turnServers)) {
+    return fallback;
+  }
+
+  return {
+    turnServers: raw.turnServers
+      .map((server): GaiaP2PVoiceTurnServer | null => {
+        if (!server || typeof server !== 'object') {
+          return null;
+        }
+        const turnUrl = typeof server.turnUrl === 'string' ? server.turnUrl.trim() : '';
+        const turnsUrl = typeof server.turnsUrl === 'string' ? server.turnsUrl.trim() : '';
+        if (!turnUrl && !turnsUrl) {
+          return null;
+        }
+        return {
+          turnUrl: turnUrl || undefined,
+          turnsUrl: turnsUrl || undefined,
+          username: typeof server.username === 'string' ? server.username : undefined,
+          credential: typeof server.credential === 'string' ? server.credential : undefined,
+        };
+      })
+      .filter((server): server is GaiaP2PVoiceTurnServer => Boolean(server)),
   };
 }
 
@@ -3045,6 +3347,29 @@ function isCurrentChannelMuted(setting: CurrentChannelNotificationSettingPayload
   return Number.isFinite(mutedUntil) && mutedUntil > Date.now();
 }
 
+function isCurrentServerMuted(setting: GaiaServerNotificationSetting | undefined): boolean {
+  if (!setting?.mutedUntil) {
+    return false;
+  }
+  const mutedUntil = Date.parse(setting.mutedUntil);
+  return Number.isFinite(mutedUntil) && mutedUntil > Date.now();
+}
+
+function serverNotificationAllowsMessage(
+  setting: GaiaServerNotificationSetting | undefined,
+  mentioned: boolean,
+  replyToUser: boolean,
+): boolean {
+  const level = coerceServerNotificationSetting(setting).level;
+  if (level === 'nothing') {
+    return false;
+  }
+  if (level === 'mentions') {
+    return mentioned || replyToUser;
+  }
+  return true;
+}
+
 function currentNotificationMentionsUser(
   content: string | undefined,
   notification: CurrentMessageNotificationPayload | undefined,
@@ -3209,6 +3534,14 @@ async function handleCurrentMessageCreate(
   });
 
   const isMentionedReply = mentioned && replyToUser;
+  const serverSetting = watcher.serverNotificationSetting;
+  if (
+    isCurrentServerMuted(serverSetting) ||
+    !serverNotificationAllowsMessage(serverSetting, mentioned, replyToUser)
+  ) {
+    return;
+  }
+
   const setting = watcher.channelNotificationSettings.get(message.channelId);
   if (isCurrentChannelMuted(setting)) {
     return;
@@ -3228,8 +3561,8 @@ async function handleCurrentMessageCreate(
 
   const channelName = watcher.channels.get(message.channelId);
   const authorName = currentAuthorName(message);
+  const messagePreview = currentMessagePreview(message);
   const title = currentNotificationTitle(kind, isMentionedReply);
-  const channelCopy = channelName ? `#${channelName}` : 'Current';
 
   await addCurrentNotification({
     id: createId('ntf'),
@@ -3243,9 +3576,10 @@ async function handleCurrentMessageCreate(
     authorId: message.authorId,
     authorName,
     authorHandle: message.author?.handle,
-    authorAvatarUrl: message.author?.avatarUrl,
+    authorAvatarUrl: await cacheAvatarUrl(message.author?.avatarUrl),
     title,
-    body: `${authorName} in ${channelCopy}: ${currentMessagePreview(message)}`,
+    body: messagePreview,
+    messagePreview,
     createdAt: message.createdAt ?? nowIso(),
   }, options);
 }
@@ -3490,10 +3824,13 @@ async function syncCurrentNotificationWatchers(): Promise<void> {
     }
 
     desiredIds.add(server.id);
+    const serverNotificationSetting =
+      store.serverNotificationSettings[server.id] ?? defaultServerNotificationSetting();
     const existing = currentNotificationWatchers.get(server.id);
     if (existing && existing.origin === origin && existing.sessionToken === sessionToken) {
       existing.serverName = server.name;
       existing.serverUrl = server.url;
+      existing.serverNotificationSetting = serverNotificationSetting;
       continue;
     }
 
@@ -3508,6 +3845,7 @@ async function syncCurrentNotificationWatchers(): Promise<void> {
       origin,
       sessionToken,
       lastSeq: notifications.currentLastSeqByServerId[server.id] ?? 0,
+      serverNotificationSetting,
       channels: new Map(),
       channelNotificationSettings: new Map(),
       stopped: false,
@@ -3693,6 +4031,523 @@ async function toggleBskyReaction(request: GaiaBskyReactionRequest): Promise<Gai
   return message;
 }
 
+function encodeBase64UrlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+}
+
+function decodeSpotifyStateId(state: string): string | null {
+  try {
+    const payload = JSON.parse(Buffer.from(state, 'base64url').toString('utf8')) as { id?: unknown };
+    return typeof payload.id === 'string' && payload.id.length > 0 ? payload.id : null;
+  } catch {
+    return null;
+  }
+}
+
+function createPkceVerifier(): string {
+  return randomBytes(64).toString('base64url');
+}
+
+function createPkceChallenge(verifier: string): string {
+  return createHash('sha256').update(verifier).digest('base64url');
+}
+
+function spotifyTokenExpiresAt(expiresIn: unknown): string {
+  const seconds = typeof expiresIn === 'number' && Number.isFinite(expiresIn) ? expiresIn : 3600;
+  return new Date(Date.now() + Math.max(60, seconds - 30) * 1000).toISOString();
+}
+
+function spotifyAuthorizeUrl(input: { state: string; codeChallenge: string }): URL {
+  const url = new URL('https://accounts.spotify.com/authorize');
+  url.searchParams.set('client_id', SPOTIFY_CLIENT_ID);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('redirect_uri', SPOTIFY_REDIRECT_URI);
+  url.searchParams.set('scope', SPOTIFY_AUTH_SCOPE);
+  url.searchParams.set('state', input.state);
+  url.searchParams.set('code_challenge_method', 'S256');
+  url.searchParams.set('code_challenge', input.codeChallenge);
+  return url;
+}
+
+async function readSpotifyTokenResponse(response: Response): Promise<SpotifyTokenResponse> {
+  if (!response.ok) {
+    let message = `Spotify token request failed with ${response.status}.`;
+    try {
+      const payload = (await response.json()) as { error_description?: string; error?: string };
+      message = payload.error_description ?? payload.error ?? message;
+    } catch {
+      // Keep status fallback.
+    }
+    throw new Error(message);
+  }
+
+  return (await response.json()) as SpotifyTokenResponse;
+}
+
+async function exchangeSpotifyCode(code: string, codeVerifier: string): Promise<SpotifyTokenRecord> {
+  const body = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: SPOTIFY_REDIRECT_URI,
+    code_verifier: codeVerifier,
+  });
+  const payload = await readSpotifyTokenResponse(
+    await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body,
+      signal: AbortSignal.timeout(12_000),
+    }),
+  );
+
+  if (!payload.access_token) {
+    throw new Error('Spotify did not return an access token.');
+  }
+
+  return {
+    accessToken: payload.access_token,
+    refreshToken: payload.refresh_token,
+    tokenType: payload.token_type ?? 'Bearer',
+    scope: payload.scope,
+    expiresAt: spotifyTokenExpiresAt(payload.expires_in),
+  };
+}
+
+async function refreshSpotifyToken(store: SpotifyAuthStore): Promise<SpotifyTokenRecord> {
+  const refreshToken = store.token?.refreshToken;
+  if (!refreshToken) {
+    throw new Error('Reconnect Spotify to refresh this session.');
+  }
+
+  const body = new URLSearchParams({
+    client_id: SPOTIFY_CLIENT_ID,
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+  });
+  const payload = await readSpotifyTokenResponse(
+    await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body,
+      signal: AbortSignal.timeout(12_000),
+    }),
+  );
+
+  if (!payload.access_token) {
+    throw new Error('Spotify did not return a refreshed access token.');
+  }
+
+  const token: SpotifyTokenRecord = {
+    accessToken: payload.access_token,
+    refreshToken: payload.refresh_token ?? refreshToken,
+    tokenType: payload.token_type ?? store.token?.tokenType ?? 'Bearer',
+    scope: payload.scope ?? store.token?.scope,
+    expiresAt: spotifyTokenExpiresAt(payload.expires_in),
+  };
+
+  await saveSpotifyAuthStore({
+    ...store,
+    token,
+  });
+  return token;
+}
+
+async function spotifyAccessToken(): Promise<SpotifyTokenRecord> {
+  const store = await readSpotifyAuthStore();
+  if (!store.token) {
+    throw new Error('Connect Spotify first.');
+  }
+
+  const expiresAt = Date.parse(store.token.expiresAt);
+  if (Number.isFinite(expiresAt) && expiresAt - Date.now() > 60_000) {
+    return store.token;
+  }
+
+  return refreshSpotifyToken(store);
+}
+
+function spotifyAuthHeader(token: SpotifyTokenRecord): string {
+  return `${token.tokenType || 'Bearer'} ${token.accessToken}`;
+}
+
+async function fetchSpotifyDisplayName(token: SpotifyTokenRecord): Promise<string | undefined> {
+  try {
+    const response = await fetch('https://api.spotify.com/v1/me', {
+      headers: {
+        authorization: spotifyAuthHeader(token),
+      },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+    const payload = (await response.json()) as { display_name?: unknown; id?: unknown };
+    return typeof payload.display_name === 'string' && payload.display_name.trim()
+      ? payload.display_name.trim()
+      : typeof payload.id === 'string'
+        ? payload.id
+        : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function firstSpotifyImageUrl(images: unknown): string | undefined {
+  if (!Array.isArray(images)) {
+    return undefined;
+  }
+
+  const sorted = images
+    .filter((image): image is { url: string; width?: number } => {
+      return Boolean(
+        image &&
+          typeof image === 'object' &&
+          typeof (image as { url?: unknown }).url === 'string',
+      );
+    })
+    .sort((left, right) => Math.abs((left.width ?? 300) - 300) - Math.abs((right.width ?? 300) - 300));
+  return sorted[0]?.url;
+}
+
+function parseSpotifyActivity(payload: unknown): GaiaSpotifyActivity | null {
+  const record = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
+  if (record.is_playing !== true) {
+    return null;
+  }
+
+  const item = record.item && typeof record.item === 'object' ? (record.item as Record<string, unknown>) : null;
+  if (!item || typeof item.name !== 'string') {
+    return null;
+  }
+
+  const type = typeof item.type === 'string' ? item.type : record.currently_playing_type;
+  const artists =
+    Array.isArray(item.artists)
+      ? item.artists
+          .map((artist) =>
+            artist && typeof artist === 'object' && typeof (artist as { name?: unknown }).name === 'string'
+              ? (artist as { name: string }).name
+              : '',
+          )
+          .filter(Boolean)
+      : [];
+  const album = item.album && typeof item.album === 'object' ? (item.album as Record<string, unknown>) : null;
+  const show = item.show && typeof item.show === 'object' ? (item.show as Record<string, unknown>) : null;
+  const externalUrls =
+    item.external_urls && typeof item.external_urls === 'object'
+      ? (item.external_urls as Record<string, unknown>)
+      : {};
+  const durationMs =
+    typeof item.duration_ms === 'number' && Number.isFinite(item.duration_ms)
+      ? Math.max(0, Math.floor(item.duration_ms))
+      : undefined;
+  const progressMs =
+    typeof record.progress_ms === 'number' && Number.isFinite(record.progress_ms)
+      ? Math.max(0, Math.floor(record.progress_ms))
+      : undefined;
+  const now = Date.now();
+
+  return {
+    provider: 'spotify',
+    title: item.name,
+    artists:
+      artists.length > 0
+        ? artists
+        : typeof show?.publisher === 'string'
+          ? [show.publisher]
+          : type === 'episode'
+            ? ['Podcast']
+            : [],
+    album:
+      typeof album?.name === 'string'
+        ? album.name
+        : typeof show?.name === 'string'
+          ? show.name
+          : undefined,
+    albumArtUrl: firstSpotifyImageUrl(album?.images ?? show?.images),
+    trackUrl: typeof externalUrls.spotify === 'string' ? externalUrls.spotify : undefined,
+    isPlaying: true,
+    progressMs,
+    durationMs,
+    startedAt: progressMs !== undefined ? new Date(now - progressMs).toISOString() : undefined,
+    updatedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + SPOTIFY_ACTIVITY_EXPIRES_MS).toISOString(),
+  };
+}
+
+async function fetchSpotifyCurrentActivity(): Promise<GaiaSpotifyActivity | null> {
+  const token = await spotifyAccessToken();
+  const response = await fetch('https://api.spotify.com/v1/me/player/currently-playing?additional_types=track,episode', {
+    headers: {
+      authorization: spotifyAuthHeader(token),
+    },
+    signal: AbortSignal.timeout(8_000),
+  });
+
+  if (response.status === 204) {
+    return null;
+  }
+  if (response.status === 401) {
+    const refreshed = await refreshSpotifyToken(await readSpotifyAuthStore());
+    const retry = await fetch('https://api.spotify.com/v1/me/player/currently-playing?additional_types=track,episode', {
+      headers: {
+        authorization: spotifyAuthHeader(refreshed),
+      },
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (retry.status === 204) {
+      return null;
+    }
+    if (!retry.ok) {
+      throw new Error(`Spotify activity request failed with ${retry.status}.`);
+    }
+    return parseSpotifyActivity(await retry.json());
+  }
+  if (!response.ok) {
+    throw new Error(`Spotify activity request failed with ${response.status}.`);
+  }
+
+  return parseSpotifyActivity(await response.json());
+}
+
+function spotifyActivitySignature(activity: GaiaSpotifyActivity | null): string {
+  if (!activity) {
+    return 'none';
+  }
+  return JSON.stringify({
+    title: activity.title,
+    artists: activity.artists,
+    album: activity.album,
+    isPlaying: activity.isPlaying,
+    progressBucket: activity.progressMs === undefined ? null : Math.floor(activity.progressMs / 15_000),
+  });
+}
+
+async function publishSpotifyActivityToCurrentServers(
+  activity: GaiaSpotifyActivity | null,
+  options: { force?: boolean } = {},
+): Promise<void> {
+  const signature = spotifyActivitySignature(activity);
+  if (!options.force && signature === lastSpotifyActivitySignature) {
+    return;
+  }
+  lastSpotifyActivitySignature = signature;
+
+  const [store, currentSessions] = await Promise.all([readStore(), readCurrentSessionStore()]);
+  await Promise.all(
+    store.servers.map(async (server) => {
+      let origin: string;
+      try {
+        origin = serverOrigin(normalizeServerUrl(server.url));
+      } catch {
+        return;
+      }
+
+      const sessionToken = currentSessions.sessions[origin]?.sessionToken;
+      if (!sessionToken) {
+        return;
+      }
+
+      try {
+        await fetch(`${origin}/api/v1/presence/audio`, {
+          method: 'PATCH',
+          headers: {
+            'content-type': 'application/json',
+            cookie: `current_session=${encodeURIComponent(sessionToken)}`,
+          },
+          body: JSON.stringify({ activity }),
+          redirect: 'manual',
+          signal: AbortSignal.timeout(6_000),
+        });
+      } catch (error) {
+        console.warn(`[gaia:spotify] Could not publish listening activity to ${server.name}.`, error);
+      }
+    }),
+  );
+}
+
+async function runSpotifySharingTick(): Promise<void> {
+  if (spotifySharingInFlight || !SPOTIFY_CLIENT_ID) {
+    return;
+  }
+
+  spotifySharingInFlight = true;
+  try {
+    const store = await readSpotifyAuthStore();
+    if (!store.token || !store.sharingEnabled) {
+      return;
+    }
+
+    const activity = await fetchSpotifyCurrentActivity();
+    const nextStore = await mutateSpotifyAuthStore((latest) => ({
+      ...latest,
+      lastActivity: activity ?? undefined,
+    }));
+    await publishSpotifyActivityToCurrentServers(activity);
+    mainWindow?.webContents.send('gaia:spotify:changed', spotifyStatusFromStore(nextStore));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Spotify sharing failed.';
+    console.warn('[gaia:spotify] Sharing tick failed.', error);
+    await broadcastSpotifyStatus(message).catch(() => undefined);
+  } finally {
+    spotifySharingInFlight = false;
+  }
+}
+
+function startSpotifySharingLoop(): void {
+  if (spotifySharingTimer) {
+    return;
+  }
+  void runSpotifySharingTick();
+  spotifySharingTimer = setInterval(() => {
+    void runSpotifySharingTick();
+  }, SPOTIFY_POLL_INTERVAL_MS);
+}
+
+function stopSpotifySharingLoop(): void {
+  if (spotifySharingTimer) {
+    clearInterval(spotifySharingTimer);
+    spotifySharingTimer = null;
+  }
+}
+
+async function setSpotifySharingEnabled(patch: GaiaSpotifySharingPatch): Promise<GaiaSpotifyStatus> {
+  const sharingEnabled = patch?.sharingEnabled === true;
+  const nextStore = await mutateSpotifyAuthStore((store) => ({
+    ...store,
+    sharingEnabled,
+    lastActivity: sharingEnabled ? store.lastActivity : undefined,
+  }));
+  if (sharingEnabled) {
+    startSpotifySharingLoop();
+    void runSpotifySharingTick();
+  } else {
+    await publishSpotifyActivityToCurrentServers(null, { force: true });
+  }
+  return broadcastSpotifyStatus(
+    sharingEnabled ? 'Spotify listening activity sharing is on.' : 'Spotify listening activity sharing is off.',
+  );
+}
+
+async function startSpotifyAuth(): Promise<GaiaSpotifyAuthStartResponse> {
+  if (!SPOTIFY_CLIENT_ID) {
+    throw new Error('Set GAIA_SPOTIFY_CLIENT_ID to enable Spotify connections.');
+  }
+
+  const port = await ensureCallbackServer();
+  const stateId = createId('spotify');
+  const state = encodeBase64UrlJson({ id: stateId, port });
+  const codeVerifier = createPkceVerifier();
+  await mutateSpotifyAuthStore((store) => ({
+    ...store,
+    states: {
+      ...store.states,
+      [stateId]: {
+        codeVerifier,
+        createdAt: Date.now(),
+      },
+    },
+  }));
+
+  const authorizationUrl = spotifyAuthorizeUrl({
+    state,
+    codeChallenge: createPkceChallenge(codeVerifier),
+  });
+  await openSafeExternalUrl(authorizationUrl);
+
+  return {
+    openedExternal: true,
+    authorizationUrl: authorizationUrl.toString(),
+    redirectUri: SPOTIFY_REDIRECT_URI,
+  };
+}
+
+async function logoutSpotify(): Promise<GaiaSpotifyStatus> {
+  await saveSpotifyAuthStore(defaultSpotifyAuthStore());
+  lastSpotifyActivitySignature = null;
+  await publishSpotifyActivityToCurrentServers(null, { force: true });
+  return broadcastSpotifyStatus('Spotify disconnected.');
+}
+
+async function handleSpotifyCallback(request: IncomingMessage, reply: ServerResponse): Promise<void> {
+  const requestUrl = new URL(request.url ?? '/', `http://127.0.0.1:${callbackPort ?? 0}`);
+  const error = requestUrl.searchParams.get('error');
+  if (error) {
+    await broadcastSpotifyStatus(error).catch(() => undefined);
+    sendHtml(
+      reply,
+      400,
+      buildAuthReturnPage({
+        ok: false,
+        title: 'Spotify connection failed',
+        message: error,
+      }),
+    );
+    return;
+  }
+
+  const code = requestUrl.searchParams.get('code') ?? '';
+  const state = requestUrl.searchParams.get('state') ?? '';
+  const stateId = decodeSpotifyStateId(state);
+  const store = await readSpotifyAuthStore();
+  const pending = stateId ? store.states[stateId] : undefined;
+  if (!code || !stateId || !pending || Date.now() - pending.createdAt > SPOTIFY_STATE_TTL_MS) {
+    await broadcastSpotifyStatus('Spotify connection expired.').catch(() => undefined);
+    sendHtml(
+      reply,
+      410,
+      buildAuthReturnPage({
+        ok: false,
+        title: 'Spotify connection expired',
+        message: 'Return to Gaia Launcher and connect Spotify again.',
+      }),
+    );
+    return;
+  }
+
+  try {
+    const token = await exchangeSpotifyCode(code, pending.codeVerifier);
+    const displayName = await fetchSpotifyDisplayName(token);
+    const { [stateId]: _used, ...states } = store.states;
+    await saveSpotifyAuthStore({
+      ...store,
+      states,
+      token,
+      displayName,
+      sharingEnabled: true,
+    });
+    startSpotifySharingLoop();
+    void runSpotifySharingTick();
+    await broadcastSpotifyStatus('Spotify connected.').catch(() => undefined);
+    sendHtml(
+      reply,
+      200,
+      buildAuthReturnPage({
+        ok: true,
+        title: 'Spotify connected',
+        message: 'Gaia Launcher can now share your current Spotify audio with Current servers.',
+      }),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Gaia could not connect Spotify.';
+    await broadcastSpotifyStatus(message).catch(() => undefined);
+    sendHtml(
+      reply,
+      500,
+      buildAuthReturnPage({
+        ok: false,
+        title: 'Spotify connection failed',
+        message,
+      }),
+    );
+  }
+}
+
 async function startCurrentOAuth(request: GaiaOAuthStartRequest): Promise<GaiaOAuthStartResponse> {
   const baseUrl = normalizeServerUrl(request.serverUrl);
   const origin = serverOrigin(baseUrl);
@@ -3837,6 +4692,11 @@ async function handleBskyCallback(request: IncomingMessage, reply: ServerRespons
 
 async function handleAuthCallback(request: IncomingMessage, reply: ServerResponse): Promise<void> {
   const requestUrl = new URL(request.url ?? '/', `http://127.0.0.1:${callbackPort ?? 0}`);
+  if (requestUrl.pathname === SPOTIFY_CALLBACK_PATH) {
+    await handleSpotifyCallback(request, reply);
+    return;
+  }
+
   if (requestUrl.pathname === BSKY_CALLBACK_PATH) {
     await handleBskyCallback(request, reply);
     return;
@@ -4048,16 +4908,56 @@ function registerIpc(): void {
   handleIpc('gaia:servers:remove', 'launcher', async (_event, serverId: string) => {
     const nextStore = await mutateStore((store) => {
       const servers = store.servers.filter((server) => server.id !== serverId);
+      const { [serverId]: _removed, ...serverNotificationSettings } = store.serverNotificationSettings;
       return {
         ...store,
         selectedServerId:
           store.selectedServerId === serverId ? servers[0]?.id : store.selectedServerId,
         servers,
+        serverNotificationSettings,
       };
     });
     void syncCurrentNotificationWatchers().catch(() => undefined);
     return nextStore;
   });
+
+  handleIpc(
+    'gaia:servers:notifications:update',
+    'launcher',
+    async (
+      _event,
+      serverId: string,
+      patch: GaiaServerNotificationSettingsPatch,
+    ): Promise<GaiaStore> => {
+      const nextStore = await mutateStore((store) => {
+        if (!store.servers.some((server) => server.id === serverId)) {
+          throw new Error('Server was not found.');
+        }
+
+        const current = store.serverNotificationSettings[serverId] ?? defaultServerNotificationSetting();
+        const patchObject = patch && typeof patch === 'object' ? patch : {};
+        const nextSettingInput: Partial<GaiaServerNotificationSetting> = {
+          ...current,
+          ...(patchObject.level ? { level: patchObject.level } : {}),
+          ...(typeof patchObject.mutedUntil === 'string' ? { mutedUntil: patchObject.mutedUntil } : {}),
+        };
+        if (patchObject.mutedUntil === null) {
+          delete nextSettingInput.mutedUntil;
+        }
+        const nextSetting = coerceServerNotificationSetting(nextSettingInput);
+
+        return {
+          ...store,
+          serverNotificationSettings: {
+            ...store.serverNotificationSettings,
+            [serverId]: nextSetting,
+          },
+        };
+      });
+      void syncCurrentNotificationWatchers().catch(() => undefined);
+      return nextStore;
+    },
+  );
 
   handleIpc('gaia:servers:select', 'launcher', async (_event, serverId: string) => {
     return mutateStore((store) => ({
@@ -4118,6 +5018,26 @@ function registerIpc(): void {
 
   handleIpc('gaia:server:client-auth', 'launcher', async (_event, serverUrl: string): Promise<GaiaServerClientAuthResult> => {
     return authenticateCurrentServerWithClient(serverUrl);
+  });
+
+  handleIpc('gaia:spotify:status', 'launcher', async (): Promise<GaiaSpotifyStatus> => {
+    return getSpotifyStatus();
+  });
+
+  handleIpc('gaia:spotify:start', 'launcher', async (): Promise<GaiaSpotifyAuthStartResponse> => {
+    return startSpotifyAuth();
+  });
+
+  handleIpc(
+    'gaia:spotify:sharing:update',
+    'launcher',
+    async (_event, patch: GaiaSpotifySharingPatch): Promise<GaiaSpotifyStatus> => {
+      return setSpotifySharingEnabled(patch);
+    },
+  );
+
+  handleIpc('gaia:spotify:logout', 'launcher', async (): Promise<GaiaSpotifyStatus> => {
+    return logoutSpotify();
   });
 
   handleIpc('gaia:bsky:convos:list', 'launcher', async (_event, request: GaiaBskyPageRequest): Promise<GaiaBskyConvoPage> => {
@@ -4365,6 +5285,7 @@ app.whenReady().then(() => {
   startGaiaWebsiteUsageHeartbeat();
   void syncCurrentNotificationWatchers();
   void notifyNotificationCenterChanged().catch(() => undefined);
+  startSpotifySharingLoop();
 
   nativeTheme.on('updated', () => {
     void broadcastAutoCurrentAppearanceMode().catch(() => undefined);
@@ -4394,6 +5315,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   stopGaiaWebsiteUsageHeartbeat();
+  stopSpotifySharingLoop();
   for (const watcher of currentNotificationWatchers.values()) {
     stopCurrentNotificationWatcher(watcher);
   }

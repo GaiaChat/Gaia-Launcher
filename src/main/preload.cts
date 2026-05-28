@@ -16,8 +16,12 @@ import type {
   GaiaCurrentAppearance,
   GaiaIdentity,
   GaiaOAuthStartRequest,
+  GaiaServerNotificationSettingsPatch,
   GaiaServerInput,
   GaiaSettingsPatch,
+  GaiaSpotifyAuthStartResponse,
+  GaiaSpotifySharingPatch,
+  GaiaSpotifyStatus,
   GaiaUpdateState,
 } from '../shared.js';
 
@@ -26,6 +30,8 @@ contextBridge.exposeInMainWorld('gaia', {
   addServer: (input: GaiaServerInput) => ipcRenderer.invoke('gaia:servers:add', input),
   updateServer: (serverId: string, input: GaiaServerInput) =>
     ipcRenderer.invoke('gaia:servers:update', serverId, input),
+  updateServerNotificationSettings: (serverId: string, patch: GaiaServerNotificationSettingsPatch) =>
+    ipcRenderer.invoke('gaia:servers:notifications:update', serverId, patch),
   removeServer: (serverId: string) => ipcRenderer.invoke('gaia:servers:remove', serverId),
   selectServer: (serverId: string) => ipcRenderer.invoke('gaia:servers:select', serverId),
   setIdentity: (identity: GaiaIdentity | null) => ipcRenderer.invoke('gaia:identity:set', identity),
@@ -35,6 +41,11 @@ contextBridge.exposeInMainWorld('gaia', {
   getClientAuthStatus: () => ipcRenderer.invoke('gaia:client-auth:status'),
   logoutClientAuth: () => ipcRenderer.invoke('gaia:client-auth:logout'),
   authenticateServerWithClient: (serverUrl: string) => ipcRenderer.invoke('gaia:server:client-auth', serverUrl),
+  getSpotifyStatus: (): Promise<GaiaSpotifyStatus> => ipcRenderer.invoke('gaia:spotify:status'),
+  startSpotifyAuth: (): Promise<GaiaSpotifyAuthStartResponse> => ipcRenderer.invoke('gaia:spotify:start'),
+  updateSpotifySharing: (patch: GaiaSpotifySharingPatch): Promise<GaiaSpotifyStatus> =>
+    ipcRenderer.invoke('gaia:spotify:sharing:update', patch),
+  logoutSpotify: (): Promise<GaiaSpotifyStatus> => ipcRenderer.invoke('gaia:spotify:logout'),
   listBskyConvos: (request: GaiaBskyPageRequest) => ipcRenderer.invoke('gaia:bsky:convos:list', request),
   listBskyMessages: (request: GaiaBskyMessagesRequest) => ipcRenderer.invoke('gaia:bsky:messages:list', request),
   searchBskyActors: (request: GaiaBskyActorSearchRequest) => ipcRenderer.invoke('gaia:bsky:actors:search', request),
@@ -69,6 +80,11 @@ contextBridge.exposeInMainWorld('gaia', {
     const listener = (_event: Electron.IpcRendererEvent, result: GaiaClientAuthResult) => callback(result);
     ipcRenderer.on('gaia:client-auth:result', listener);
     return () => ipcRenderer.removeListener('gaia:client-auth:result', listener);
+  },
+  onSpotifyChanged: (callback: (status: GaiaSpotifyStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: GaiaSpotifyStatus) => callback(status);
+    ipcRenderer.on('gaia:spotify:changed', listener);
+    return () => ipcRenderer.removeListener('gaia:spotify:changed', listener);
   },
   onNotificationsChanged: (callback: (state: GaiaNotificationCenterState) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, state: GaiaNotificationCenterState) => callback(state);

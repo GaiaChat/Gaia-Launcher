@@ -1,6 +1,6 @@
 {
   "name": "gaia-launcher",
-  "version": "0.3.0-beta.4",
+  "version": "0.4.0-beta.1",
   "private": true,
   "type": "module",
   "description": "Gaia Launcher desktop app",

@@ -14,16 +14,30 @@ import type {
   GaiaNotification,
   GaiaNotificationCenterState,
   GaiaOAuthStartResponse,
+  GaiaP2PVoiceIceConfig,
+  GaiaP2PVoiceSettings,
+  GaiaP2PVoiceSignalMessage,
   GaiaServer,
+  GaiaServerNotificationLevel,
+  GaiaServerNotificationSetting,
   GaiaServerProbe,
   GaiaSettings,
   GaiaSettingsPatch,
+  GaiaSpotifyStatus,
   GaiaPushToTalkMode,
   GaiaSoundSettings,
   GaiaStore,
   GaiaUpdateState,
   GaiaVideoSettings,
 } from '../shared';
+import {
+  formatP2PVoiceSignalBundle,
+  ManualP2PVoiceSignalingTransport,
+  parseP2PVoiceSignalText,
+  P2PVoiceCallService,
+  P2P_VOICE_DIRECT_FAILURE_MESSAGE,
+  type P2PVoiceState,
+} from './p2p-voice';
 import { createElement, type CSSProperties } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import LiquidGlass from 'liquid-glass-react';
@@ -113,6 +127,9 @@ const DEFAULT_VIDEO_SETTINGS: GaiaVideoSettings = {
   cameraFrameRate: 30,
   mirrorPreview: true,
 };
+const DEFAULT_P2P_VOICE_SETTINGS: GaiaP2PVoiceSettings = {
+  turnServers: [],
+};
 const DEFAULT_GAIA_SETTINGS: GaiaSettings = {
   startupView: 'last',
   lastContentView: 'server',
@@ -126,7 +143,12 @@ const DEFAULT_GAIA_SETTINGS: GaiaSettings = {
   perfProbe: false,
   sound: DEFAULT_SOUND_SETTINGS,
   video: DEFAULT_VIDEO_SETTINGS,
+  p2pVoice: DEFAULT_P2P_VOICE_SETTINGS,
 };
+const DEFAULT_SERVER_NOTIFICATION_SETTING: GaiaServerNotificationSetting = {
+  level: 'all',
+};
+const SERVER_MUTE_FOREVER_UNTIL = '9999-12-31T23:59:59.999Z';
 const SETTINGS_SECTIONS: Array<{
   id: SettingsSectionId;
   title: string;
@@ -150,6 +172,12 @@ const SETTINGS_SECTIONS: Array<{
     title: 'Messages',
     summary: 'GIF playback behavior for Bluesky messages.',
     searchText: 'messages gif playback animated media always focused paused never',
+  },
+  {
+    id: 'connections',
+    title: 'Connections',
+    summary: 'Connected services and activity sharing.',
+    searchText: 'connections connected services spotify music audio now playing listening activity share current profile popout redirect oauth p2p voice webrtc stun turn relay ice',
   },
   {
     id: 'sound',
@@ -186,7 +214,7 @@ const messageTimeFormatter = new Intl.DateTimeFormat(undefined, {
 const systemAppearanceQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
 type PickerTab = 'gifs' | 'emoji';
-type SettingsSectionId = 'general' | 'appearance' | 'messages' | 'sound' | 'updates' | 'performance';
+type SettingsSectionId = 'general' | 'appearance' | 'messages' | 'connections' | 'sound' | 'updates' | 'performance';
 type MediaDeviceChoiceKind = 'audioinput' | 'audiooutput' | 'videoinput';
 type AudioDeviceChoice = {
   deviceId: string;
@@ -634,7 +662,7 @@ root.innerHTML = `
             <div class="messages-user" id="messagesUser">Not signed in</div>
             <div class="convo-list" id="convoList"></div>
           </aside>
-          <section class="message-thread chat-pane">
+          <section class="message-thread chat-pane" id="messageThread">
             <header class="thread-header chat-header">
               <div class="chat-title-glass-shell glass-panel liquid-surface" id="threadTitleGlassShell">
                 <span class="liquid-glass-backdrop channel-title-liquid-glass" id="threadTitleLiquidGlass" aria-hidden="true"></span>
@@ -642,7 +670,67 @@ root.innerHTML = `
                 <h1 id="threadTitle">Select a message</h1>
                 <span class="thread-subtitle" id="threadId"></span>
               </div>
+              <button class="thread-call-button" id="messageCallButton" type="button" title="Start P2P voice call" aria-label="Start P2P voice call" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path
+                    d="M6.45 5.25c.39-.39 1.04-.39 1.43 0l2.04 2.04c.35.35.4.9.12 1.31l-.98 1.45a.9.9 0 0 0 .1 1.14l3.65 3.65a.9.9 0 0 0 1.14.1l1.45-.98c.41-.28.96-.23 1.31.12l2.04 2.04c.39.39.39 1.04 0 1.43l-1.1 1.1c-.7.7-1.72.98-2.68.72-5.02-1.34-8.96-5.28-10.3-10.3-.26-.96.02-1.98.72-2.68l1.06-1.14Z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
             </header>
+            <section class="direct-call-panel hidden" id="p2pCallPanel" aria-label="Direct P2P voice call">
+              <button class="direct-call-close" id="p2pCallCloseButton" type="button" aria-label="Close call panel">×</button>
+              <div class="direct-call-hero">
+                <div class="direct-call-avatar" id="p2pCallAvatar"></div>
+                <div class="direct-call-copy">
+                  <span id="p2pVoiceMode">STUN-only</span>
+                  <strong id="p2pCallTitle">Direct call</strong>
+                  <p id="p2pVoiceStatus">Ready for a direct P2P voice call.</p>
+                </div>
+              </div>
+              <p class="direct-call-error hidden" id="p2pVoiceError"></p>
+              <div class="direct-call-stats">
+                <span>Local mic <strong id="p2pLocalMicState">Off</strong></span>
+                <span>Remote audio <strong id="p2pRemoteAudioState">Waiting</strong></span>
+                <span id="p2pVoiceTransportLabel">Direct P2P / STUN-only</span>
+              </div>
+              <div class="direct-call-actions">
+                <button class="direct-call-control direct-call-mic" id="p2pMuteVoiceButton" type="button" disabled>
+                  <span>Mute</span>
+                </button>
+                <button class="direct-call-control direct-call-start" id="p2pJoinVoiceButton" type="button">
+                  <span>Start Call</span>
+                </button>
+                <button class="direct-call-control direct-call-end" id="p2pLeaveVoiceButton" type="button" disabled>
+                  <span>End</span>
+                </button>
+              </div>
+              <details class="direct-call-signaling">
+                <summary>Manual signaling</summary>
+                <div class="direct-call-signal-grid">
+                  <label>
+                    <span>Local signal</span>
+                    <textarea id="p2pLocalSignalOutput" readonly spellcheck="false"></textarea>
+                  </label>
+                  <label>
+                    <span>Peer signal</span>
+                    <textarea id="p2pPeerSignalInput" spellcheck="false"></textarea>
+                  </label>
+                </div>
+                <div class="direct-call-signal-actions">
+                  <button class="settings-secondary-action" id="p2pCopySignalButton" type="button">Copy Local</button>
+                  <button class="settings-secondary-action" id="p2pClearSignalButton" type="button">Clear Local</button>
+                  <button class="settings-secondary-action" id="p2pApplySignalButton" type="button">Apply Peer</button>
+                  <button class="settings-secondary-action" id="p2pClearPeerSignalButton" type="button">Clear Peer</button>
+                </div>
+              </details>
+              <audio id="p2pRemoteAudio" autoplay controls></audio>
+            </section>
             <div class="message-list messages-list" id="messageList"></div>
             <form class="composer message-composer" id="messageComposerForm">
               <div class="composer-inline glass-panel composer-glass-panel liquid-surface" id="messageComposerGlassPanel">
@@ -811,11 +899,7 @@ root.innerHTML = `
         </footer>
       </form>
     </dialog>
-    <div class="server-context-menu hidden" id="serverContextMenu" role="menu">
-      <button type="button" id="contextRefreshButton" role="menuitem">Refresh</button>
-      <button type="button" id="contextEditButton" role="menuitem">Edit Server</button>
-      <button type="button" id="contextSignInButton" role="menuitem">Sign In</button>
-    </div>
+    <div class="context-menu discord-context-menu server-context-menu hidden" id="serverContextMenu" role="menu"></div>
     <div class="context-menu discord-context-menu hidden" id="messageContextMenu" role="menu"></div>
     <div class="context-menu discord-context-menu rail-appearance-menu hidden" id="railAppearanceMenu" role="menu"></div>
     <div class="gif-modal-backdrop hidden" id="gifModalBackdrop">
@@ -857,6 +941,28 @@ const notificationCenterEmpty = document.querySelector<HTMLDivElement>('#notific
 const notificationDetailBody = document.querySelector<HTMLDivElement>('#notificationDetailBody')!;
 const messagesButton = document.querySelector<HTMLButtonElement>('#messagesButton')!;
 const messagesView = document.querySelector<HTMLElement>('#messagesView')!;
+const messageThread = document.querySelector<HTMLElement>('#messageThread')!;
+const messageCallButton = document.querySelector<HTMLButtonElement>('#messageCallButton')!;
+const p2pCallPanel = document.querySelector<HTMLElement>('#p2pCallPanel')!;
+const p2pCallCloseButton = document.querySelector<HTMLButtonElement>('#p2pCallCloseButton')!;
+const p2pCallAvatar = document.querySelector<HTMLDivElement>('#p2pCallAvatar')!;
+const p2pCallTitle = document.querySelector<HTMLElement>('#p2pCallTitle')!;
+const p2pVoiceMode = document.querySelector<HTMLSpanElement>('#p2pVoiceMode')!;
+const p2pVoiceStatus = document.querySelector<HTMLElement>('#p2pVoiceStatus')!;
+const p2pVoiceError = document.querySelector<HTMLParagraphElement>('#p2pVoiceError')!;
+const p2pJoinVoiceButton = document.querySelector<HTMLButtonElement>('#p2pJoinVoiceButton')!;
+const p2pMuteVoiceButton = document.querySelector<HTMLButtonElement>('#p2pMuteVoiceButton')!;
+const p2pLeaveVoiceButton = document.querySelector<HTMLButtonElement>('#p2pLeaveVoiceButton')!;
+const p2pLocalMicState = document.querySelector<HTMLElement>('#p2pLocalMicState')!;
+const p2pRemoteAudioState = document.querySelector<HTMLElement>('#p2pRemoteAudioState')!;
+const p2pLocalSignalOutput = document.querySelector<HTMLTextAreaElement>('#p2pLocalSignalOutput')!;
+const p2pPeerSignalInput = document.querySelector<HTMLTextAreaElement>('#p2pPeerSignalInput')!;
+const p2pCopySignalButton = document.querySelector<HTMLButtonElement>('#p2pCopySignalButton')!;
+const p2pClearSignalButton = document.querySelector<HTMLButtonElement>('#p2pClearSignalButton')!;
+const p2pApplySignalButton = document.querySelector<HTMLButtonElement>('#p2pApplySignalButton')!;
+const p2pClearPeerSignalButton = document.querySelector<HTMLButtonElement>('#p2pClearPeerSignalButton')!;
+const p2pVoiceTransportLabel = document.querySelector<HTMLElement>('#p2pVoiceTransportLabel')!;
+const p2pRemoteAudio = document.querySelector<HTMLAudioElement>('#p2pRemoteAudio')!;
 const startChatButton = document.querySelector<HTMLButtonElement>('#startChatButton')!;
 const messagesUser = document.querySelector<HTMLDivElement>('#messagesUser')!;
 const convoList = document.querySelector<HTMLDivElement>('#convoList')!;
@@ -921,9 +1027,6 @@ const newChatError = document.querySelector<HTMLParagraphElement>('#newChatError
 const closeNewChatDialogButton = document.querySelector<HTMLButtonElement>('#closeNewChatDialogButton')!;
 const cancelNewChatDialogButton = document.querySelector<HTMLButtonElement>('#cancelNewChatDialogButton')!;
 const serverContextMenu = document.querySelector<HTMLDivElement>('#serverContextMenu')!;
-const contextRefreshButton = document.querySelector<HTMLButtonElement>('#contextRefreshButton')!;
-const contextEditButton = document.querySelector<HTMLButtonElement>('#contextEditButton')!;
-const contextSignInButton = document.querySelector<HTMLButtonElement>('#contextSignInButton')!;
 const messageContextMenu = document.querySelector<HTMLDivElement>('#messageContextMenu')!;
 const railAppearanceMenu = document.querySelector<HTMLDivElement>('#railAppearanceMenu')!;
 const gifModalBackdrop = document.querySelector<HTMLDivElement>('#gifModalBackdrop')!;
@@ -964,6 +1067,24 @@ let outputTestAudio: HTMLAudioElement | null = null;
 let notificationCenterState: GaiaNotificationCenterState = { notifications: [], unreadCount: 0 };
 let selectedNotificationId: string | null = null;
 let bskyNotificationBaselineReady = false;
+let spotifyStatus: GaiaSpotifyStatus = {
+  configured: false,
+  connected: false,
+  sharingEnabled: false,
+  redirectUri: 'https://gaiachat.github.io/spotify/callback/',
+  scope: 'user-read-currently-playing',
+};
+let spotifyActionInFlight: 'connect' | 'sharing' | 'disconnect' | 'copy' | null = null;
+const p2pVoiceSignaling = new ManualP2PVoiceSignalingTransport(handleP2PVoiceOutboundSignal);
+const p2pVoiceService = new P2PVoiceCallService({
+  signaling: p2pVoiceSignaling,
+  iceConfig: p2pVoiceIceConfigFromSettings(DEFAULT_P2P_VOICE_SETTINGS),
+});
+let p2pVoiceState: P2PVoiceState = p2pVoiceService.getState();
+let p2pVoiceOutboundSignals: GaiaP2PVoiceSignalMessage[] = [];
+let p2pVoiceActionInFlight: 'join' | 'leave' | 'mute' | 'apply-signal' | 'copy-signal' | null = null;
+let p2pDirectCallOpen = false;
+let p2pDirectCallConvoId: string | null = null;
 let microphoneTestState: MicrophoneTestState = 'idle';
 let microphoneTestMessage = 'Start a local mic test to check the selected input.';
 let microphoneTestLevel = 0;
@@ -973,7 +1094,6 @@ let cameraPreviewMessage = 'Start a camera preview to check your selected webcam
 let cameraPreviewRuntime: CameraPreviewRuntime | null = null;
 let authServerId: string | null = null;
 let authRequestId: string | null = null;
-let contextServerId: string | null = null;
 let clientAuthStatus: GaiaClientAuthStatus = { authenticated: false };
 let clientAuthPending = false;
 let authProviderChoice: AuthProviderChoice = 'bluesky';
@@ -1282,6 +1402,7 @@ function refreshLiquidGlassSurfaceSizes(): void {
 function cloneSettings(settings: GaiaSettings): GaiaSettings {
   const sound = settings.sound ?? DEFAULT_SOUND_SETTINGS;
   const video = settings.video ?? DEFAULT_VIDEO_SETTINGS;
+  const p2pVoice = settings.p2pVoice ?? DEFAULT_P2P_VOICE_SETTINGS;
   return {
     ...settings,
     animatedCurrentBackgrounds:
@@ -1294,11 +1415,25 @@ function cloneSettings(settings: GaiaSettings): GaiaSettings {
         : DEFAULT_GAIA_SETTINGS.fastGraphicsMode,
     sound: { ...DEFAULT_SOUND_SETTINGS, ...sound },
     video: { ...DEFAULT_VIDEO_SETTINGS, ...video },
+    p2pVoice: {
+      turnServers: [...(p2pVoice.turnServers ?? [])],
+    },
   };
 }
 
 function currentSettings(): GaiaSettings {
   return store?.settings ?? DEFAULT_GAIA_SETTINGS;
+}
+
+function p2pVoiceIceConfigFromSettings(settings: GaiaP2PVoiceSettings): GaiaP2PVoiceIceConfig {
+  return {
+    stunUrls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun2.l.google.com:19302',
+    ],
+    turnServers: [...(settings.turnServers ?? [])],
+  };
 }
 
 function normalizeAccentColor(value: string | null | undefined): string | null {
@@ -1552,7 +1687,8 @@ function settingsEqual(left: GaiaSettings, right: GaiaSettings): boolean {
     left.fastGraphicsMode === right.fastGraphicsMode &&
     left.perfProbe === right.perfProbe &&
     soundSettingsEqual(left.sound, right.sound) &&
-    videoSettingsEqual(left.video, right.video)
+    videoSettingsEqual(left.video, right.video) &&
+    p2pVoiceSettingsEqual(left.p2pVoice, right.p2pVoice)
   );
 }
 
@@ -1576,6 +1712,22 @@ function videoSettingsEqual(left: GaiaVideoSettings, right: GaiaVideoSettings): 
     left.cameraFrameRate === right.cameraFrameRate &&
     left.mirrorPreview === right.mirrorPreview
   );
+}
+
+function p2pVoiceSettingsEqual(left: GaiaP2PVoiceSettings, right: GaiaP2PVoiceSettings): boolean {
+  if (left.turnServers.length !== right.turnServers.length) {
+    return false;
+  }
+  return left.turnServers.every((server, index) => {
+    const other = right.turnServers[index];
+    return (
+      other &&
+      server.turnUrl === other.turnUrl &&
+      server.turnsUrl === other.turnsUrl &&
+      server.username === other.username &&
+      server.credential === other.credential
+    );
+  });
 }
 
 function isSettingsDirty(): boolean {
@@ -1667,6 +1819,7 @@ function applyAppSettings(settings = currentSettings()): void {
   shell.dataset.animatedCurrentBackgrounds = settings.animatedCurrentBackgrounds ? 'enabled' : 'disabled';
   shell.dataset.fastGraphics = settings.fastGraphicsMode ? 'true' : 'false';
   syncPerfProbeStorage(settings.perfProbe);
+  p2pVoiceService.setIceConfig(p2pVoiceIceConfigFromSettings(settings.p2pVoice));
   syncVisibleGifPlayback();
   renderFloatingLiquidGlassSurfaces();
   if (
@@ -2756,6 +2909,25 @@ function createSettingsRange(
   input.addEventListener('change', () => onChange(input.valueAsNumber));
   control.append(input, output);
   return control;
+}
+
+function createSettingsTextInput(
+  label: string,
+  value: string,
+  placeholder: string,
+  onChange: (value: string) => void,
+  type: 'text' | 'password' | 'url' = 'text',
+): HTMLInputElement {
+  const input = document.createElement('input');
+  input.className = 'settings-text-input';
+  input.type = type;
+  input.value = value;
+  input.placeholder = placeholder;
+  input.autocomplete = 'off';
+  input.spellcheck = false;
+  input.setAttribute('aria-label', label);
+  input.addEventListener('change', () => onChange(input.value.trim()));
+  return input;
 }
 
 function defaultDeviceChoice<K extends MediaDeviceChoiceKind>(kind: K): K extends 'videoinput' ? VideoDeviceChoice : AudioDeviceChoice {
@@ -3873,6 +4045,443 @@ function renderMessageSettings(draft: GaiaSettings): DocumentFragment {
   return fragment;
 }
 
+function spotifyAccountSummary(status: GaiaSpotifyStatus): string {
+  if (!status.configured) {
+    return 'Set GAIA_SPOTIFY_CLIENT_ID before connecting Spotify.';
+  }
+  if (!status.connected) {
+    return status.message ?? 'Not connected.';
+  }
+  return status.displayName ? `Connected as ${status.displayName}.` : 'Connected.';
+}
+
+function spotifyActivitySummary(status: GaiaSpotifyStatus): string {
+  const activity = status.activity;
+  if (!activity) {
+    return status.connected ? 'No Spotify audio is playing right now.' : 'Connect Spotify first.';
+  }
+  const artist = activity.artists.length > 0 ? activity.artists.join(', ') : 'Spotify';
+  return `${activity.title} - ${artist}`;
+}
+
+async function loadSpotifyStatus(): Promise<void> {
+  try {
+    spotifyStatus = await window.gaia.getSpotifyStatus();
+  } catch (error) {
+    spotifyStatus = {
+      ...spotifyStatus,
+      configured: false,
+      connected: false,
+      sharingEnabled: false,
+      message: error instanceof Error ? error.message : 'Could not read Spotify status.',
+    };
+  }
+  if (activeView === 'settings' && activeSettingsSection === 'connections') {
+    renderSettingsWorkspace();
+  }
+}
+
+async function runSpotifyConnectAction(): Promise<void> {
+  spotifyActionInFlight = 'connect';
+  renderSettingsWorkspace();
+  try {
+    await window.gaia.startSpotifyAuth();
+    setStatus('Check your browser', 'neutral');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not start Spotify connection.', 'bad');
+  } finally {
+    spotifyActionInFlight = null;
+    await loadSpotifyStatus();
+  }
+}
+
+async function runSpotifySharingAction(sharingEnabled: boolean): Promise<void> {
+  spotifyActionInFlight = 'sharing';
+  renderSettingsWorkspace();
+  try {
+    spotifyStatus = await window.gaia.updateSpotifySharing({ sharingEnabled });
+    setStatus(spotifyStatus.message ?? (sharingEnabled ? 'Spotify sharing on' : 'Spotify sharing off'), 'good');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not update Spotify sharing.', 'bad');
+  } finally {
+    spotifyActionInFlight = null;
+    renderSettingsWorkspace();
+  }
+}
+
+async function runSpotifyDisconnectAction(): Promise<void> {
+  spotifyActionInFlight = 'disconnect';
+  renderSettingsWorkspace();
+  try {
+    spotifyStatus = await window.gaia.logoutSpotify();
+    setStatus(spotifyStatus.message ?? 'Spotify disconnected', 'warn');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not disconnect Spotify.', 'bad');
+  } finally {
+    spotifyActionInFlight = null;
+    renderSettingsWorkspace();
+  }
+}
+
+async function copySpotifyRedirectUri(): Promise<void> {
+  spotifyActionInFlight = 'copy';
+  renderSettingsWorkspace();
+  try {
+    await navigator.clipboard.writeText(spotifyStatus.redirectUri);
+    setStatus('Redirect URI copied', 'good');
+  } catch {
+    setStatus(spotifyStatus.redirectUri, 'neutral');
+  } finally {
+    spotifyActionInFlight = null;
+    renderSettingsWorkspace();
+  }
+}
+
+function handleP2PVoiceOutboundSignal(message: GaiaP2PVoiceSignalMessage): void {
+  p2pVoiceOutboundSignals.push(message);
+  if (p2pVoiceOutboundSignals.length > 100) {
+    p2pVoiceOutboundSignals = p2pVoiceOutboundSignals.slice(-100);
+  }
+  syncP2PVoiceSignalOutput();
+  if (p2pDirectCallOpen) {
+    renderP2PDirectCallPanel();
+  }
+}
+
+function p2pVoiceCanJoin(state = p2pVoiceState): boolean {
+  return state.phase === 'idle' || state.phase === 'ended' || state.phase === 'failed';
+}
+
+function p2pVoiceCanLeave(state = p2pVoiceState): boolean {
+  return !p2pVoiceCanJoin(state);
+}
+
+function p2pVoiceModeLabel(state = p2pVoiceState): string {
+  return state.usingTurn ? 'Direct P2P + optional TURN' : 'STUN-only';
+}
+
+function p2pVoiceTransportLabelText(state = p2pVoiceState): string {
+  return state.usingTurn
+    ? 'Direct P2P first, with optional community TURN config available'
+    : 'Direct P2P / STUN-only';
+}
+
+function syncP2PVoiceSignalOutput(): void {
+  p2pLocalSignalOutput.value = formatP2PVoiceSignalBundle(p2pVoiceOutboundSignals);
+}
+
+function selectedP2PCallTitle(): string {
+  const convo = selectedConvo();
+  return convo ? convoTitle(convo) : 'Direct call';
+}
+
+function renderP2PCallAvatar(): void {
+  const convo = selectedConvo();
+  if (!convo) {
+    p2pCallAvatar.replaceChildren();
+    return;
+  }
+  p2pCallAvatar.replaceChildren(buildAvatar(convoPrimaryActor(convo), convoTitle(convo), 'md'));
+}
+
+function renderP2PDirectCallPanel(): void {
+  const canCall = clientAuthStatus.authenticated && Boolean(selectedConvoId);
+  messageCallButton.disabled = !canCall;
+  messageCallButton.classList.toggle('active', p2pDirectCallOpen);
+  messageCallButton.setAttribute('aria-pressed', p2pDirectCallOpen ? 'true' : 'false');
+  p2pCallPanel.classList.toggle('hidden', !p2pDirectCallOpen);
+  messageThread.classList.toggle('direct-call-open', p2pDirectCallOpen);
+  if (!p2pDirectCallOpen) {
+    return;
+  }
+
+  syncP2PVoiceSignalOutput();
+  const busy = p2pVoiceActionInFlight !== null;
+  const error = p2pVoiceState.error;
+  renderP2PCallAvatar();
+  p2pCallTitle.textContent = selectedP2PCallTitle();
+  p2pCallPanel.dataset.phase = p2pVoiceState.phase;
+  p2pVoiceMode.textContent = p2pVoiceModeLabel();
+  p2pVoiceStatus.textContent = p2pVoiceState.status;
+  p2pVoiceError.textContent = error ?? '';
+  p2pVoiceError.classList.toggle('hidden', !error);
+  p2pVoiceTransportLabel.textContent = p2pVoiceTransportLabelText();
+
+  p2pJoinVoiceButton.disabled = busy || !p2pVoiceCanJoin();
+  p2pJoinVoiceButton.querySelector('span')!.textContent =
+    p2pVoiceActionInFlight === 'join' ? 'Calling...' : 'Start Call';
+  p2pLeaveVoiceButton.disabled = busy || !p2pVoiceCanLeave();
+  p2pLeaveVoiceButton.querySelector('span')!.textContent =
+    p2pVoiceActionInFlight === 'leave' ? 'Ending...' : 'End';
+  p2pMuteVoiceButton.disabled = busy || !p2pVoiceState.localStreamActive;
+  p2pMuteVoiceButton.classList.toggle('muted', p2pVoiceState.muted);
+  p2pMuteVoiceButton.querySelector('span')!.textContent = p2pVoiceState.muted ? 'Unmute' : 'Mute';
+
+  p2pLocalMicState.textContent = p2pVoiceState.localStreamActive
+    ? p2pVoiceState.muted
+      ? 'Muted'
+      : 'On'
+    : 'Off';
+  p2pRemoteAudioState.textContent = p2pVoiceState.remoteStreamActive
+    ? 'Receiving'
+    : p2pVoiceState.phase === 'connected'
+      ? 'No remote track'
+      : 'Waiting';
+  p2pCopySignalButton.disabled = busy || p2pVoiceOutboundSignals.length === 0;
+  p2pClearSignalButton.disabled = busy || p2pVoiceOutboundSignals.length === 0;
+  p2pApplySignalButton.disabled = busy || p2pPeerSignalInput.value.trim().length === 0;
+  p2pClearPeerSignalButton.disabled = busy || p2pPeerSignalInput.value.trim().length === 0;
+}
+
+function openP2PDirectCall(autoJoin = false): void {
+  if (!selectedConvoId) {
+    setStatus('Select a conversation before starting a call.', 'warn');
+    return;
+  }
+  p2pDirectCallOpen = true;
+  p2pDirectCallConvoId = selectedConvoId;
+  renderP2PDirectCallPanel();
+  if (autoJoin && p2pVoiceCanJoin()) {
+    void joinP2PVoice();
+  }
+}
+
+function closeP2PDirectCall(options: { leave?: boolean } = {}): void {
+  if (options.leave && p2pVoiceCanLeave()) {
+    p2pVoiceService.leaveVoice();
+  }
+  p2pDirectCallOpen = false;
+  p2pDirectCallConvoId = null;
+  renderP2PDirectCallPanel();
+}
+
+function syncP2PDirectCallConversation(nextConvoId: string | null): void {
+  if (!p2pDirectCallOpen || p2pDirectCallConvoId === nextConvoId) {
+    return;
+  }
+  if (p2pVoiceCanLeave()) {
+    p2pVoiceService.leaveVoice();
+  }
+  p2pDirectCallOpen = false;
+  p2pDirectCallConvoId = null;
+}
+
+function updateP2PVoiceTurnDraft(patch: Partial<GaiaP2PVoiceSettings['turnServers'][number]>): void {
+  const draft = cloneSettings(settingsDraft ?? currentSettings());
+  const current = draft.p2pVoice.turnServers[0] ?? {};
+  const next = {
+    ...current,
+    ...patch,
+  };
+  const normalized = {
+    turnUrl: next.turnUrl?.trim() || undefined,
+    turnsUrl: next.turnsUrl?.trim() || undefined,
+    username: next.username?.trim() || undefined,
+    credential: next.credential?.trim() || undefined,
+  };
+  updateSettingsDraft({
+    p2pVoice: {
+      turnServers: normalized.turnUrl || normalized.turnsUrl ? [normalized] : [],
+    },
+  });
+}
+
+function appendP2PVoiceTurnSettings(card: HTMLElement, draft: GaiaSettings): void {
+  const turn = draft.p2pVoice.turnServers[0] ?? {};
+  appendSettingsRow(
+    card,
+    'TURN URL',
+    'Optional community relay URL. Leave blank for STUN-only P2P.',
+    createSettingsTextInput('TURN URL', turn.turnUrl ?? '', 'turn:relay.example.org:3478', (turnUrl) =>
+      updateP2PVoiceTurnDraft({ turnUrl }),
+    'url'),
+  );
+  appendSettingsRow(
+    card,
+    'TURNS URL',
+    'Optional TLS relay URL for networks that require it.',
+    createSettingsTextInput('TURNS URL', turn.turnsUrl ?? '', 'turns:relay.example.org:5349', (turnsUrl) =>
+      updateP2PVoiceTurnDraft({ turnsUrl }),
+    'url'),
+  );
+  appendSettingsRow(
+    card,
+    'Username',
+    'Optional relay username. Gaia ships with none.',
+    createSettingsTextInput('TURN username', turn.username ?? '', 'community-user', (username) =>
+      updateP2PVoiceTurnDraft({ username }),
+    ),
+  );
+  appendSettingsRow(
+    card,
+    'Credential',
+    'Optional relay credential. Do not paste paid service secrets here.',
+    createSettingsTextInput('TURN credential', turn.credential ?? '', 'community credential', (credential) =>
+      updateP2PVoiceTurnDraft({ credential }),
+    'password'),
+  );
+}
+
+async function joinP2PVoice(): Promise<void> {
+  if (!p2pDirectCallOpen) {
+    openP2PDirectCall(false);
+  }
+  p2pVoiceActionInFlight = 'join';
+  renderP2PDirectCallPanel();
+  try {
+    await p2pVoiceService.joinVoice();
+    setStatus('P2P voice offer ready', 'neutral');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Could not start P2P voice.';
+    setStatus(message, 'bad');
+  } finally {
+    p2pVoiceActionInFlight = null;
+    renderP2PDirectCallPanel();
+  }
+}
+
+async function toggleP2PVoiceMute(): Promise<void> {
+  p2pVoiceActionInFlight = 'mute';
+  renderP2PDirectCallPanel();
+  try {
+    await p2pVoiceService.setMuted(!p2pVoiceState.muted);
+  } finally {
+    p2pVoiceActionInFlight = null;
+    renderP2PDirectCallPanel();
+  }
+}
+
+function leaveP2PVoice(): void {
+  p2pVoiceActionInFlight = 'leave';
+  renderP2PDirectCallPanel();
+  p2pVoiceService.leaveVoice();
+  p2pVoiceActionInFlight = null;
+  renderP2PDirectCallPanel();
+}
+
+async function copyP2PVoiceSignal(): Promise<void> {
+  const signal = p2pLocalSignalOutput.value.trim();
+  if (!signal) {
+    return;
+  }
+  p2pVoiceActionInFlight = 'copy-signal';
+  renderP2PDirectCallPanel();
+  try {
+    await navigator.clipboard.writeText(signal);
+    setStatus('P2P voice signal copied', 'good');
+  } catch {
+    p2pLocalSignalOutput.focus();
+    p2pLocalSignalOutput.select();
+    setStatus('Select and copy the signal manually', 'warn');
+  } finally {
+    p2pVoiceActionInFlight = null;
+    renderP2PDirectCallPanel();
+  }
+}
+
+function clearP2PVoiceSignal(): void {
+  p2pVoiceOutboundSignals = [];
+  syncP2PVoiceSignalOutput();
+  renderP2PDirectCallPanel();
+}
+
+async function applyP2PVoiceSignal(): Promise<void> {
+  p2pVoiceActionInFlight = 'apply-signal';
+  renderP2PDirectCallPanel();
+  try {
+    const parsed = parseP2PVoiceSignalText(p2pPeerSignalInput.value);
+    if (parsed.errors.length > 0) {
+      setStatus(parsed.errors[0] ?? 'Could not read peer signal.', 'bad');
+      return;
+    }
+    for (const message of parsed.messages) {
+      p2pVoiceSignaling.receive(message);
+    }
+    p2pPeerSignalInput.value = '';
+    setStatus(`Applied ${parsed.messages.length} P2P signal${parsed.messages.length === 1 ? '' : 's'}`, 'good');
+  } finally {
+    p2pVoiceActionInFlight = null;
+    renderP2PDirectCallPanel();
+  }
+}
+
+function renderConnectionsSettings(draft: GaiaSettings): DocumentFragment {
+  const fragment = document.createDocumentFragment();
+  const busy = spotifyActionInFlight !== null;
+
+  const spotifyCard = createSettingsCard('Spotify', 'Share currently playing Spotify audio with Current profile popouts.');
+  const connectLabel =
+    spotifyActionInFlight === 'connect'
+      ? 'Opening...'
+      : spotifyStatus.connected
+        ? 'Reconnect'
+        : 'Connect';
+  const accountActions = spotifyStatus.connected
+    ? createSettingsActionGroup(
+        createSettingsAction(connectLabel, () => void runSpotifyConnectAction(), busy || !spotifyStatus.configured),
+        createSettingsAction(
+          spotifyActionInFlight === 'disconnect' ? 'Disconnecting...' : 'Disconnect',
+          () => void runSpotifyDisconnectAction(),
+          busy,
+        ),
+      )
+    : createSettingsActionGroup(
+        createSettingsAction(connectLabel, () => void runSpotifyConnectAction(), busy || !spotifyStatus.configured),
+      );
+
+  appendSettingsRow(
+    spotifyCard,
+    'Account',
+    spotifyAccountSummary(spotifyStatus),
+    accountActions,
+  );
+
+  const sharingToggle = createSettingsToggle('Share Spotify listening activity', spotifyStatus.sharingEnabled, (sharingEnabled) => {
+    void runSpotifySharingAction(sharingEnabled);
+  });
+  sharingToggle.disabled = busy || !spotifyStatus.connected;
+  appendSettingsRow(
+    spotifyCard,
+    'Share activity',
+    spotifyStatus.connected
+      ? 'Shows your current Spotify audio when people open your Current profile.'
+      : 'Connect Spotify before sharing activity.',
+    sharingToggle,
+  );
+
+  appendSettingsRow(
+    spotifyCard,
+    'Now playing',
+    spotifyActivitySummary(spotifyStatus),
+    createUpdatePill(spotifyStatus.activity ? 'Live' : 'Idle'),
+  );
+
+  appendSettingsRow(
+    spotifyCard,
+    'Redirect URI',
+    spotifyStatus.redirectUri,
+    createSettingsAction(
+      spotifyActionInFlight === 'copy' ? 'Copied' : 'Copy',
+      () => void copySpotifyRedirectUri(),
+      busy,
+    ),
+  );
+
+  const p2pCard = createSettingsCard('Experimental P2P Voice', 'Direct microphone calls for 1-on-1 or tiny rooms.');
+  appendSettingsRow(
+    p2pCard,
+    'ICE mode',
+    draft.p2pVoice.turnServers.length > 0
+      ? 'STUN plus optional community TURN configuration.'
+      : 'STUN-only. No relay credentials are configured.',
+    createUpdatePill(draft.p2pVoice.turnServers.length > 0 ? 'TURN optional' : 'STUN-only'),
+  );
+  appendP2PVoiceTurnSettings(p2pCard, draft);
+
+  fragment.append(spotifyCard, p2pCard);
+  return fragment;
+}
+
 function renderSoundSettings(draft: GaiaSettings): DocumentFragment {
   ensureAudioDevicesLoaded();
   const fragment = document.createDocumentFragment();
@@ -4160,6 +4769,9 @@ function renderActiveSettingsSection(sectionId: SettingsSectionId, draft: GaiaSe
   if (sectionId === 'messages') {
     return renderMessageSettings(draft);
   }
+  if (sectionId === 'connections') {
+    return renderConnectionsSettings(draft);
+  }
   if (sectionId === 'sound') {
     return renderSoundSettings(draft);
   }
@@ -4284,6 +4896,11 @@ function settingsPatchForSave(draft: GaiaSettings): GaiaSettingsPatch {
   }
   if (!videoSettingsEqual(draft.video, current.video)) {
     patch.video = { ...draft.video };
+  }
+  if (!p2pVoiceSettingsEqual(draft.p2pVoice, current.p2pVoice)) {
+    patch.p2pVoice = {
+      turnServers: [...draft.p2pVoice.turnServers],
+    };
   }
 
   return patch;
@@ -5050,22 +5667,81 @@ function primeBskyNotificationBaseline(nextConvos: GaiaBskyConvo[]): void {
   bskyNotificationBaselineReady = true;
 }
 
+type BskyMessageDesktopNotification = {
+  convoId: string;
+  messageId: string;
+  title: string;
+  body: string;
+  icon?: string;
+};
+
+function bskyMessagePreview(text: string | undefined): string {
+  const preview = text?.replace(/\s+/g, ' ').trim();
+  if (!preview) {
+    return 'Sent a message.';
+  }
+  return preview.length > 160 ? `${preview.slice(0, 157)}...` : preview;
+}
+
+function createBskyMessageDesktopNotification(convo: GaiaBskyConvo): BskyMessageDesktopNotification | null {
+  const lastMessage = convo.lastMessage;
+  if (!lastMessage) {
+    return null;
+  }
+
+  const actor = convo.members.find((member) => member.did === lastMessage.senderDid);
+  const senderName = actor ? displayActor(actor) : 'Bluesky user';
+  return {
+    convoId: convo.id,
+    messageId: lastMessage.id,
+    title: senderName,
+    body: bskyMessagePreview(lastMessage.text),
+    icon: actor?.avatar,
+  };
+}
+
+async function showBskyMessageDesktopNotification(item: BskyMessageDesktopNotification): Promise<void> {
+  if (!('Notification' in window) || Notification.permission === 'denied') {
+    return;
+  }
+
+  let permission: NotificationPermission = Notification.permission;
+  if (permission === 'default') {
+    permission = await Notification.requestPermission();
+  }
+  if (permission !== 'granted') {
+    return;
+  }
+
+  const toast = new Notification(item.title, {
+    body: item.body,
+    icon: item.icon,
+  });
+  toast.onclick = () => {
+    window.focus();
+    selectedConvoId = item.convoId;
+    switchToMessagesView();
+    void loadMessagesPage(undefined, true);
+    toast.close();
+  };
+}
+
 function shouldPlayBskyMessageNotification(
   previousConvos: GaiaBskyConvo[],
   nextConvos: GaiaBskyConvo[],
-): boolean {
+): BskyMessageDesktopNotification[] {
   const ownDid = clientAuthStatus.profile?.did;
   if (!ownDid) {
-    return false;
+    return [];
   }
 
   if (!bskyNotificationBaselineReady) {
     primeBskyNotificationBaseline(nextConvos);
-    return false;
+    return [];
   }
 
   const previousById = new Map(previousConvos.map((convo) => [convo.id, convo]));
-  let shouldPlay = false;
+  const notifications: BskyMessageDesktopNotification[] = [];
 
   for (const convo of nextConvos) {
     const lastMessage = convo.lastMessage;
@@ -5080,10 +5756,13 @@ function shouldPlayBskyMessageNotification(
     }
 
     rememberBskyNotificationMessageId(lastMessage.id);
-    shouldPlay = true;
+    const notification = createBskyMessageDesktopNotification(convo);
+    if (notification) {
+      notifications.push(notification);
+    }
   }
 
-  return shouldPlay;
+  return notifications;
 }
 
 function keepExistingConvoOrder(nextConvos: GaiaBskyConvo[]): GaiaBskyConvo[] {
@@ -6190,6 +6869,9 @@ function updateViewVisibility(): void {
   const showMessagesWorkspace = authenticated && showingMessages;
   const showNotificationsWorkspace = authenticated && showingNotifications;
   const showSettingsWorkspace = authenticated && showingSettings;
+  if (!authenticated) {
+    closeP2PDirectCall({ leave: true });
+  }
   const nextWorkspaceView: ActiveView | null = showServerWorkspace
     ? 'server'
     : showMessagesWorkspace
@@ -6251,6 +6933,7 @@ function updateViewVisibility(): void {
     renderSettingsWorkspace();
   }
   if (authenticated && showingMessages) {
+    renderP2PDirectCallPanel();
     renderFloatingLiquidGlassSurfaces();
     refreshLiquidGlassSurfaceSizes();
   }
@@ -6348,7 +7031,7 @@ function closeSettingsView(): void {
 
 function hideServerContextMenu(): void {
   serverContextMenu.classList.add('hidden');
-  contextServerId = null;
+  serverContextMenu.replaceChildren();
 }
 
 function hideMessageContextMenu(): void {
@@ -6363,16 +7046,39 @@ function hideRailAppearanceMenu(): void {
   settingsButton.setAttribute('aria-expanded', 'false');
 }
 
+function serverNotificationSetting(serverId: string): GaiaServerNotificationSetting {
+  return store?.serverNotificationSettings?.[serverId] ?? DEFAULT_SERVER_NOTIFICATION_SETTING;
+}
+
+function serverNotificationLevelLabel(level: GaiaServerNotificationLevel): string {
+  if (level === 'mentions') {
+    return 'Only @mentions';
+  }
+  if (level === 'nothing') {
+    return 'Nothing';
+  }
+  return 'All Messages';
+}
+
+function isServerNotificationMuted(setting: GaiaServerNotificationSetting): boolean {
+  if (!setting.mutedUntil) {
+    return false;
+  }
+  const mutedUntil = Date.parse(setting.mutedUntil);
+  return Number.isFinite(mutedUntil) && mutedUntil > Date.now();
+}
+
 function openServerContextMenu(server: GaiaServer, x: number, y: number): void {
   hideMessageContextMenu();
   hideRailAppearanceMenu();
-  contextServerId = server.id;
+  renderServerContextMenu(serverContextMenuSections(server));
+  serverContextMenu.style.left = `${x}px`;
+  serverContextMenu.style.top = `${y}px`;
   serverContextMenu.classList.remove('hidden');
   const menuRect = serverContextMenu.getBoundingClientRect();
-  const left = Math.min(x, window.innerWidth - menuRect.width - 8);
-  const top = Math.min(y, window.innerHeight - menuRect.height - 8);
-  serverContextMenu.style.left = `${Math.max(8, left)}px`;
-  serverContextMenu.style.top = `${Math.max(8, top)}px`;
+  const position = clampMenuPosition(x, y, menuRect.width, menuRect.height);
+  serverContextMenu.style.left = `${position.x}px`;
+  serverContextMenu.style.top = `${position.y}px`;
 }
 
 function clampMenuPosition(x: number, y: number, width: number, height: number): { x: number; y: number } {
@@ -6480,6 +7186,119 @@ async function copyToClipboard(value: string, label: string): Promise<void> {
   } catch {
     setStatus(`Could not copy ${label.toLowerCase()}`, 'bad');
   }
+}
+
+async function updateServerNotificationSetting(
+  server: GaiaServer,
+  patch: { level?: GaiaServerNotificationLevel; mutedUntil?: string | null },
+): Promise<void> {
+  store = await window.gaia.updateServerNotificationSettings(server.id, patch);
+  selectedServerId = store.selectedServerId;
+  render();
+
+  const setting = serverNotificationSetting(server.id);
+  const muted = isServerNotificationMuted(setting);
+  setStatus(
+    muted ? `${serverRailName(server)} muted` : `${serverNotificationLevelLabel(setting.level)} for ${serverRailName(server)}`,
+    'good',
+  );
+}
+
+async function leaveServerFromRail(server: GaiaServer): Promise<void> {
+  const serverName = serverRailName(server);
+  const shouldLeave = window.confirm(`Leave ${serverName}? Gaia will remove it from your launcher rail.`);
+  if (!shouldLeave) {
+    return;
+  }
+
+  store = await window.gaia.removeServer(server.id);
+  selectedServerId = store.selectedServerId;
+  serverRailIdentityCache.delete(server.id);
+  serverBackgroundCache.delete(server.id);
+  serverSessionCache.delete(server.id);
+  serverProbeCache.delete(server.id);
+  const webview = serverWebviews.get(server.id);
+  if (webview) {
+    webview.remove();
+    serverWebviews.delete(server.id);
+  }
+  loadSelectedServer();
+  setStatus(`Left ${serverName}`, 'warn');
+}
+
+function serverContextMenuSections(server: GaiaServer): ContextMenuSection[] {
+  const setting = serverNotificationSetting(server.id);
+  const muted = isServerNotificationMuted(setting);
+  const activeLevel = setting.level;
+  const levelItem = (level: GaiaServerNotificationLevel): ContextMenuItem => ({
+    id: `server-notification-${level}`,
+    label: serverNotificationLevelLabel(level),
+    icon: activeLevel === level && !muted ? '✓' : level === 'mentions' ? '@' : level === 'nothing' ? '-' : '#',
+    disabled: activeLevel === level && !muted,
+    disabledReason: `${serverNotificationLevelLabel(level)} is already selected.`,
+    run: () => updateServerNotificationSetting(server, { level, mutedUntil: null }),
+  });
+
+  return [
+    {
+      id: 'server-notifications',
+      items: [
+        levelItem('all'),
+        levelItem('mentions'),
+        levelItem('nothing'),
+        {
+          id: 'server-mute',
+          label: muted ? 'Unmute Server' : 'Mute Server',
+          icon: muted ? '✓' : '!',
+          run: () =>
+            updateServerNotificationSetting(server, {
+              mutedUntil: muted ? null : SERVER_MUTE_FOREVER_UNTIL,
+            }),
+        },
+      ],
+    },
+    {
+      id: 'server-actions',
+      items: [
+        {
+          id: 'server-refresh',
+          label: 'Refresh',
+          icon: '↻',
+          run: () => refreshServer(server),
+        },
+        {
+          id: 'server-edit',
+          label: 'Edit Server',
+          icon: '✎',
+          run: async () => {
+            await selectServer(server.id);
+            openServerDialog('edit');
+          },
+        },
+        {
+          id: 'server-sign-in',
+          label: 'Sign In',
+          icon: '→',
+          run: async () => {
+            await selectServer(server.id);
+            await startLauncherAuth(server);
+          },
+        },
+      ],
+    },
+    {
+      id: 'server-danger',
+      items: [
+        {
+          id: 'server-leave',
+          label: 'Leave Server',
+          icon: '×',
+          variant: 'danger',
+          run: () => leaveServerFromRail(server),
+        },
+      ],
+    },
+  ];
 }
 
 function senderProfileUrl(actor: GaiaBskyConvo['members'][number] | GaiaBskyProfile | undefined): string | undefined {
@@ -6661,6 +7480,14 @@ function renderMessageContextMenu(sections: ContextMenuSection[]): void {
     className: 'context-menu-message',
     dismiss: hideMessageContextMenu,
     errorMessage: 'Message action failed',
+  });
+}
+
+function renderServerContextMenu(sections: ContextMenuSection[]): void {
+  renderContextMenu(serverContextMenu, sections, {
+    className: 'server-context-menu',
+    dismiss: hideServerContextMenu,
+    errorMessage: 'Server action failed',
   });
 }
 
@@ -6994,6 +7821,7 @@ async function refreshClientAuthStatus(): Promise<void> {
 
 async function initialize(): Promise<void> {
   await refreshClientAuthStatus();
+  await loadSpotifyStatus();
   await refreshStore();
   await loadUpdateState();
   startLauncherUpdateLiveChecks();
@@ -7418,6 +8246,8 @@ function renderMessagesViewport(): void {
   threadTitleGlassShell.classList.toggle('has-thread-subtitle', subtitle.length > 0);
   messageComposerInput.disabled = !convo;
   messageSendButton.disabled = !convo || messageComposerInput.value.trim().length === 0;
+  syncP2PDirectCallConversation(selectedConvoId);
+  renderP2PDirectCallPanel();
 
   renderConvos();
   renderMessages();
@@ -7478,6 +8308,7 @@ function renderConvos(): void {
       if (selectedConvoId === convo.id) {
         return;
       }
+      syncP2PDirectCallConversation(convo.id);
       selectedConvoId = convo.id;
       updateConvoReadState(convo.id, 0);
       currentMessageCursor = undefined;
@@ -8186,10 +9017,13 @@ async function refreshMessagesSilently(): Promise<void> {
     const previousSelectedConvoId = selectedConvoId;
     const previousConvos = convos;
     const page = await getConvosPage(undefined, true);
-    const playNotification = shouldPlayBskyMessageNotification(previousConvos, page.convos);
+    const desktopNotifications = shouldPlayBskyMessageNotification(previousConvos, page.convos);
     setConvos(page.convos, page.cursor);
-    if (playNotification) {
+    if (desktopNotifications.length > 0) {
       void playGaiaNotificationSound('Bluesky message notification');
+      for (const notification of desktopNotifications) {
+        void showBskyMessageDesktopNotification(notification);
+      }
     }
 
     if (previousSelectedConvoId && convos.some((convo) => convo.id === previousSelectedConvoId)) {
@@ -8628,6 +9462,33 @@ messagesButton.addEventListener('click', () => {
   hideServerContextMenu();
   switchToMessagesView();
 });
+messageCallButton.addEventListener('click', () => {
+  openP2PDirectCall(true);
+});
+p2pCallCloseButton.addEventListener('click', () => {
+  closeP2PDirectCall({ leave: false });
+});
+p2pJoinVoiceButton.addEventListener('click', () => {
+  void joinP2PVoice();
+});
+p2pMuteVoiceButton.addEventListener('click', () => {
+  void toggleP2PVoiceMute();
+});
+p2pLeaveVoiceButton.addEventListener('click', () => {
+  closeP2PDirectCall({ leave: true });
+});
+p2pCopySignalButton.addEventListener('click', () => {
+  void copyP2PVoiceSignal();
+});
+p2pClearSignalButton.addEventListener('click', clearP2PVoiceSignal);
+p2pApplySignalButton.addEventListener('click', () => {
+  void applyP2PVoiceSignal();
+});
+p2pClearPeerSignalButton.addEventListener('click', () => {
+  p2pPeerSignalInput.value = '';
+  renderP2PDirectCallPanel();
+});
+p2pPeerSignalInput.addEventListener('input', renderP2PDirectCallPanel);
 settingsCloseButton.addEventListener('click', closeSettingsView);
 settingsSearchInput.addEventListener('input', () => {
   settingsSearchQuery = settingsSearchInput.value;
@@ -8724,29 +9585,11 @@ authProviderAddressInput.addEventListener('keydown', (event) => {
   }
 });
 closeAuthButton.addEventListener('click', closeAuthOverlay);
-contextRefreshButton.addEventListener('click', () => {
-  const server = serverById(contextServerId);
-  if (server) {
-    refreshServer(server);
-  }
-});
-contextEditButton.addEventListener('click', () => {
-  const server = serverById(contextServerId);
-  hideServerContextMenu();
-  if (!server) {
-    return;
-  }
-  void selectServer(server.id).then(() => openServerDialog('edit'));
-});
-contextSignInButton.addEventListener('click', () => {
-  const server = serverById(contextServerId);
-  hideServerContextMenu();
-  if (server) {
-    void selectServer(server.id).then(() => startLauncherAuth(server));
-  }
-});
 serverContextMenu.addEventListener('click', (event) => {
   event.stopPropagation();
+});
+serverContextMenu.addEventListener('contextmenu', (event) => {
+  event.preventDefault();
 });
 messageContextMenu.addEventListener('click', (event) => {
   event.stopPropagation();
@@ -8812,6 +9655,12 @@ new MutationObserver(() => {
 }).observe(shell, { attributes: true, attributeFilter: ['class'] });
 window.gaia.onAuthResult(handleAuthResult);
 window.gaia.onClientAuthResult(handleClientAuthResult);
+window.gaia.onSpotifyChanged((status) => {
+  spotifyStatus = status;
+  if (activeView === 'settings' && activeSettingsSection === 'connections') {
+    renderSettingsWorkspace();
+  }
+});
 window.gaia.onNotificationsChanged((state) => {
   notificationCenterState = state;
   renderNotificationCenter();
@@ -8823,6 +9672,21 @@ window.gaia.onUpdateStateChanged((state) => {
     renderSettingsWorkspace();
   }
 });
+p2pVoiceService.subscribe((state) => {
+  p2pVoiceState = state;
+  if (p2pDirectCallOpen) {
+    renderP2PDirectCallPanel();
+  }
+});
+p2pVoiceService.onRemoteStream((stream) => {
+  p2pRemoteAudio.srcObject = stream;
+  if (stream) {
+    void p2pRemoteAudio.play().catch(() => undefined);
+  }
+  if (p2pDirectCallOpen) {
+    renderP2PDirectCallPanel();
+  }
+});
 
 window.addEventListener('focus', () => {
   void maybeCheckForLauncherUpdates(LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS);
@@ -8831,6 +9695,9 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     void maybeCheckForLauncherUpdates(LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS);
   }
+});
+window.addEventListener('beforeunload', () => {
+  p2pVoiceService.destroy();
 });
 
 void initialize();

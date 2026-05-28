@@ -28,7 +28,11 @@ import type {
   GaiaOAuthStartResponse,
   GaiaServerClientAuthResult,
   GaiaServerInput,
+  GaiaServerNotificationSettingsPatch,
   GaiaServerProbe,
+  GaiaSpotifyAuthStartResponse,
+  GaiaSpotifySharingPatch,
+  GaiaSpotifyStatus,
   GaiaSettingsPatch,
   GaiaStore,
   GaiaUpdateState,
@@ -40,6 +44,10 @@ declare global {
       getStore(): Promise<GaiaStore>;
       addServer(input: GaiaServerInput): Promise<GaiaStore>;
       updateServer(serverId: string, input: GaiaServerInput): Promise<GaiaStore>;
+      updateServerNotificationSettings(
+        serverId: string,
+        patch: GaiaServerNotificationSettingsPatch,
+      ): Promise<GaiaStore>;
       removeServer(serverId: string): Promise<GaiaStore>;
       selectServer(serverId: string): Promise<GaiaStore>;
       setIdentity(identity: GaiaIdentity | null): Promise<GaiaStore>;
@@ -49,6 +57,10 @@ declare global {
       getClientAuthStatus(): Promise<GaiaClientAuthStatus>;
       logoutClientAuth(): Promise<GaiaLogoutResult>;
       authenticateServerWithClient(serverUrl: string): Promise<GaiaServerClientAuthResult>;
+      getSpotifyStatus(): Promise<GaiaSpotifyStatus>;
+      startSpotifyAuth(): Promise<GaiaSpotifyAuthStartResponse>;
+      updateSpotifySharing(patch: GaiaSpotifySharingPatch): Promise<GaiaSpotifyStatus>;
+      logoutSpotify(): Promise<GaiaSpotifyStatus>;
       listBskyConvos(request: GaiaBskyPageRequest): Promise<GaiaBskyConvoPage>;
       listBskyMessages(request: GaiaBskyMessagesRequest): Promise<GaiaBskyMessagePage>;
       searchBskyActors(request: GaiaBskyActorSearchRequest): Promise<GaiaBskyActor[]>;
@@ -72,6 +84,7 @@ declare global {
       openUpdateDownloads(): Promise<GaiaUpdateState>;
       onAuthResult(callback: (result: GaiaAuthResult) => void): () => void;
       onClientAuthResult(callback: (result: GaiaClientAuthResult) => void): () => void;
+      onSpotifyChanged(callback: (status: GaiaSpotifyStatus) => void): () => void;
       onNotificationsChanged(callback: (state: GaiaNotificationCenterState) => void): () => void;
       onUpdateStateChanged(callback: (state: GaiaUpdateState) => void): () => void;
     };
