@@ -135,6 +135,7 @@ jobs:
       GAIA_RELEASE_VERSION: ${{ inputs.version }}
       GAIA_RELEASE_TAG: ${{ inputs.tag }}
       GAIA_RELEASE_NAME: ${{ inputs.release_name }}
+      RELEASE_REPO: GaiaChat/Gaia-Launcher
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Download release artifacts
@@ -144,7 +145,7 @@ jobs:
 
       - name: Create GitHub release
         run: |
-          mapfile -t assets < <(find release-artifacts -type f \( -name '*.yml' -o -name '*.blockmap' -o -name 'GaiaLauncher-*' \) | sort)
+          mapfile -t assets < <(find release-artifacts -type f \( \( -name '*.yml' ! -name 'builder-debug.yml' \) -o -name '*.blockmap' -o -name 'GaiaLauncher-*' \) | sort)
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "No release assets found." >&2
             exit 1
@@ -152,6 +153,7 @@ jobs:
           printf 'Release assets:\n'
           printf '  %s\n' "${assets[@]}"
           gh release create "${GAIA_RELEASE_TAG}" "${assets[@]}" \
+            --repo "${RELEASE_REPO}" \
             --title "${GAIA_RELEASE_NAME}" \
             --notes "Gaia Launcher ${GAIA_RELEASE_NAME} (${GAIA_RELEASE_VERSION})." \
             --latest
