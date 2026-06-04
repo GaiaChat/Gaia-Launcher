@@ -20,10 +20,10 @@ await cp(join(projectRoot, 'src', 'assets', 'appicon'), join(projectRoot, 'dist'
 run('vite', ['build']);
 
 function run(command, args) {
-  const binary = process.platform === 'win32' ? `${command}.cmd` : command;
-  const result = spawnSync(binary, args, {
+  const result = spawnSync(command, args, {
     cwd: projectRoot,
     env: process.env,
+    shell: process.platform === 'win32',
     stdio: 'inherit',
   });
 
