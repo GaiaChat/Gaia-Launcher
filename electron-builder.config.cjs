@@ -67,8 +67,41 @@ module.exports = {
       },
     },
   },
+  mac: {
+    target: [
+      {
+        target: 'dmg',
+        arch: ['x64', 'arm64'],
+      },
+      {
+        target: 'zip',
+        arch: ['x64', 'arm64'],
+      },
+    ],
+    category: 'public.app-category.social-networking',
+    artifactName: 'GaiaLauncher-${version}-mac-${arch}.${ext}',
+  },
+  win: {
+    target: [
+      {
+        target: 'nsis',
+        arch: ['x64'],
+      },
+      {
+        target: 'zip',
+        arch: ['x64'],
+      },
+    ],
+    artifactName: 'GaiaLauncher-${version}-win-${arch}.${ext}',
+  },
   appImage: {
     artifactName: 'GaiaLauncher-${version}-${arch}.${ext}',
+  },
+  nsis: {
+    oneClick: false,
+    perMachine: false,
+    allowToChangeInstallationDirectory: true,
+    shortcutName: 'Gaia Launcher',
   },
   deb: {
     packageName: 'gaia-launcher',

@@ -6,31 +6,48 @@ on:
       version:
         description: "Semver version to build"
         required: true
-        default: "0.3.0-beta.1"
+        default: "0.5.0-beta.1"
       tag:
         description: "Release tag"
         required: true
-        default: "v0.3.0-beta.1"
+        default: "v0.5.0-beta.1"
       release_name:
         description: "Release title"
         required: true
-        default: "0.3.0 Beta 1"
+        default: "0.5.0 Beta 1"
 
 permissions:
   contents: write
 
 jobs:
-  linux:
-    name: Build Linux release
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.label }} release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            label: Linux
+            os: ubuntu-latest
+            build_command: pnpm dist:linux
+          - platform: macos
+            label: macOS
+            os: macos-latest
+            build_command: pnpm dist:mac
+          - platform: windows
+            label: Windows
+            os: windows-latest
+            build_command: pnpm dist:windows
+    defaults:
+      run:
+        shell: bash
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CSC_IDENTITY_AUTO_DISCOVERY: false
       GAIA_UPDATE_BASE_URL: https://github.com/GaiaChat/Gaia-Launcher/releases/latest/download
       GAIA_RELEASES_URL: https://github.com/GaiaChat/Gaia-Launcher/releases/latest
       GAIA_RELEASE_VERSION: ${{ inputs.version }}
-      GAIA_RELEASE_TAG: ${{ inputs.tag }}
-      GAIA_RELEASE_NAME: ${{ inputs.release_name }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,6 +63,7 @@ jobs:
           version: "10.33.0"
 
       - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y fakeroot libarchive-tools rpm
@@ -68,27 +86,65 @@ jobs:
           NODE
 
       - name: Build release artifacts
-        run: pnpm dist:linux
+        run: ${{ matrix.build_command }}
 
       - name: Refresh AppImage update metadata
+        if: matrix.platform == 'linux'
         run: pnpm exec electron-builder --config electron-builder.config.cjs --linux AppImage --publish=never
 
-      - name: Verify update metadata
+      - name: Verify release artifacts
         run: |
-          metadata_file="release-app/latest-linux.yml"
-          if [[ ! -f "${metadata_file}" && "${GAIA_RELEASE_VERSION}" == *-* ]]; then
-            channel="${GAIA_RELEASE_VERSION#*-}"
-            channel="${channel%%.*}"
-            metadata_file="release-app/${channel}-linux.yml"
+          find release-app -maxdepth 1 -type f -print | sort
+          shopt -s nullglob
+          assets=(release-app/GaiaLauncher-* release-app/*.yml release-app/*.blockmap)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "No release assets found." >&2
+            exit 1
           fi
-          test -f "${metadata_file}"
-          cat "${metadata_file}"
-          grep -F "version: ${GAIA_RELEASE_VERSION}" "${metadata_file}"
-          grep -F "path: GaiaLauncher-${GAIA_RELEASE_VERSION}-x86_64.AppImage" "${metadata_file}"
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            metadata_file="release-app/latest-linux.yml"
+            if [[ ! -f "${metadata_file}" && "${GAIA_RELEASE_VERSION}" == *-* ]]; then
+              channel="${GAIA_RELEASE_VERSION#*-}"
+              channel="${channel%%.*}"
+              metadata_file="release-app/${channel}-linux.yml"
+            fi
+            test -f "${metadata_file}"
+            cat "${metadata_file}"
+            grep -F "version: ${GAIA_RELEASE_VERSION}" "${metadata_file}"
+            grep -F "path: GaiaLauncher-${GAIA_RELEASE_VERSION}-x86_64.AppImage" "${metadata_file}"
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaia-release-${{ matrix.platform }}
+          path: |
+            release-app/GaiaLauncher-*
+            release-app/*.yml
+            release-app/*.blockmap
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      GAIA_RELEASE_VERSION: ${{ inputs.version }}
+      GAIA_RELEASE_TAG: ${{ inputs.tag }}
+      GAIA_RELEASE_NAME: ${{ inputs.release_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
 
       - name: Create GitHub release
         run: |
-          mapfile -t assets < <(find release-app -maxdepth 1 -type f \( -name '*-linux.yml' -o -name 'latest-linux.yml' -o -name 'GaiaLauncher-*' \) | sort)
+          mapfile -t assets < <(find release-artifacts -type f \( -name '*.yml' -o -name '*.blockmap' -o -name 'GaiaLauncher-*' \) | sort)
           if [ "${#assets[@]}" -eq 0 ]; then
             echo "No release assets found." >&2
             exit 1

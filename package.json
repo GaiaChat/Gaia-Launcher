@@ -1,6 +1,6 @@
 {
   "name": "gaia-launcher",
-  "version": "0.4.0-beta.1",
+  "version": "0.5.0-beta.1",
   "private": true,
   "type": "module",
   "description": "Gaia Launcher desktop app",
@@ -11,9 +11,11 @@
   },
   "main": "dist/main/main.js",
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.main.json && mkdir -p dist/assets && cp src/assets/logo.svg src/assets/logo_grayscale.svg dist/assets/ && cp -R src/assets/appicon dist/assets/ && vite build",
+    "build": "node scripts/build.mjs",
     "dist": "node scripts/build-linux-artifacts.mjs --publish=never",
     "dist:linux": "node scripts/build-linux-artifacts.mjs --publish=never",
+    "dist:mac": "pnpm build && pnpm exec electron-builder --config electron-builder.config.cjs --mac --x64 --arm64 --publish=never",
+    "dist:windows": "pnpm build && pnpm exec electron-builder --config electron-builder.config.cjs --win --x64 --publish=never",
     "release:linux": "node scripts/build-linux-artifacts.mjs --publish=always",
     "dev": "pnpm build && pnpm start",
     "start": "./scripts/run-electron.sh",
