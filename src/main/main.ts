@@ -131,6 +131,7 @@ const MAX_AVATAR_IMAGE_BYTES = 2 * 1024 * 1024;
 const CURRENT_GATEWAY_PROTOCOL = 'current-session';
 const CURRENT_GATEWAY_TOKEN_PROTOCOL_PREFIX = 'current-session-token.';
 const SAFE_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:']);
+const CURRENT_MEDIA_PERMISSIONS = new Set(['media', 'speaker-selection', 'display-capture']);
 
 app.setName('Gaia Launcher');
 if (process.platform === 'win32') {
@@ -436,6 +437,7 @@ function configureHighRefreshRendering(): void {
 }
 
 configureHighRefreshRendering();
+trustCurrentHttpOriginsForMedia('startup');
 
 const renderSwitchNames = [
   'disable-frame-rate-limit',
@@ -454,6 +456,7 @@ const renderSwitchNames = [
   'ozone-platform',
   'ozone-platform-hint',
   'use-gl',
+  'unsafely-treat-insecure-origin-as-secure',
 ];
 
 function getRenderSwitchSnapshot(): Record<string, string | boolean> {
@@ -1013,6 +1016,23 @@ function canSendLauncherTokenToOrigin(origin: string): boolean {
   return parsed.protocol === 'https:' || (parsed.protocol === 'http:' && isPrivateNetworkOrigin(origin));
 }
 
+function normalizeHttpOriginForSecureTreatment(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(normalizeServerUrl(rawUrl));
+    if (parsed.protocol !== 'http:') {
+      return null;
+    }
+    parsed.username = '';
+    parsed.password = '';
+    parsed.pathname = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
 function storedServerOriginsSnapshot(): Set<string> {
   try {
     const contents = readFileSync(storePath(), 'utf8');
@@ -1020,6 +1040,36 @@ function storedServerOriginsSnapshot(): Set<string> {
   } catch {
     return new Set(defaultStore().servers.map((server) => serverOrigin(server.url)));
   }
+}
+
+function configuredCurrentHttpOrigins(): string[] {
+  const origins = new Set<string>();
+
+  for (const origin of storedServerOriginsSnapshot()) {
+    const normalized = normalizeHttpOriginForSecureTreatment(origin);
+    if (normalized) {
+      origins.add(normalized);
+    }
+  }
+
+  for (const rawOrigin of (process.env.GAIA_CURRENT_TRUSTED_HTTP_ORIGINS ?? '').split(',')) {
+    const normalized = normalizeHttpOriginForSecureTreatment(rawOrigin.trim());
+    if (normalized) {
+      origins.add(normalized);
+    }
+  }
+
+  return [...origins].sort();
+}
+
+function trustCurrentHttpOriginsForMedia(reason: string): void {
+  const origins = configuredCurrentHttpOrigins();
+  if (!origins.length) {
+    return;
+  }
+
+  appendUniqueSwitchValues('unsafely-treat-insecure-origin-as-secure', origins);
+  console.info(`[gaia:current-webview:media] treating HTTP origins as secure (${reason}): ${origins.join(', ')}`);
 }
 
 function canAttachCurrentWebviewSource(sourceUrl: string | undefined): boolean {
@@ -4851,8 +4901,9 @@ async function ensureCallbackServer(): Promise<number> {
 function configureCurrentPartition(): void {
   const currentSession = session.fromPartition(CURRENT_PARTITION);
   currentSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    callback(['media', 'speaker-selection', 'display-capture'].includes(permission));
+    callback(CURRENT_MEDIA_PERMISSIONS.has(permission));
   });
+  currentSession.setPermissionCheckHandler((_webContents, permission) => CURRENT_MEDIA_PERMISSIONS.has(permission));
   configureDisplayCapture(currentSession, 'current');
 }
 
@@ -4880,6 +4931,7 @@ function registerIpc(): void {
       selectedServerId: server.id,
       servers: [...store.servers, server],
     }));
+    trustCurrentHttpOriginsForMedia('server added');
     void syncCurrentNotificationWatchers().catch(() => undefined);
     return nextStore;
   });
@@ -4901,6 +4953,7 @@ function registerIpc(): void {
         ),
       };
     });
+    trustCurrentHttpOriginsForMedia('server updated');
     void syncCurrentNotificationWatchers().catch(() => undefined);
     return nextStore;
   });
@@ -5277,6 +5330,7 @@ function createWindow(): void {
 app.whenReady().then(() => {
   void logPerformanceDiagnostics();
   configureAppIdentity();
+  trustCurrentHttpOriginsForMedia('ready');
   configureLauncherSession();
   configureCurrentPartition();
   configureGaiaUpdater();
