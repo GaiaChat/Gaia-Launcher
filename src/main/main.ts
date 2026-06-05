@@ -132,6 +132,13 @@ const CURRENT_GATEWAY_PROTOCOL = 'current-session';
 const CURRENT_GATEWAY_TOKEN_PROTOCOL_PREFIX = 'current-session-token.';
 const SAFE_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:']);
 const CURRENT_MEDIA_PERMISSIONS = new Set(['media', 'speaker-selection', 'display-capture']);
+const CURRENT_READABLE_FILE_PERMISSION = 'fileSystem';
+
+type CurrentPermissionDetails = {
+  requestingUrl?: string;
+  fileAccessType?: 'writable' | 'readable';
+  isDirectory?: boolean;
+};
 
 app.setName('Gaia Launcher');
 if (process.platform === 'win32') {
@@ -1072,9 +1079,9 @@ function trustCurrentHttpOriginsForMedia(reason: string): void {
   console.info(`[gaia:current-webview:media] treating HTTP origins as secure (${reason}): ${origins.join(', ')}`);
 }
 
-function canAttachCurrentWebviewSource(sourceUrl: string | undefined): boolean {
+function isStoredCurrentServerSource(sourceUrl: string | undefined): boolean {
   if (!sourceUrl || sourceUrl === 'about:blank') {
-    return true;
+    return false;
   }
 
   try {
@@ -1083,6 +1090,47 @@ function canAttachCurrentWebviewSource(sourceUrl: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+function canAttachCurrentWebviewSource(sourceUrl: string | undefined): boolean {
+  if (!sourceUrl || sourceUrl === 'about:blank') {
+    return true;
+  }
+
+  return isStoredCurrentServerSource(sourceUrl);
+}
+
+function isCurrentPermissionSource(
+  webContents: WebContents | null | undefined,
+  requestingOrigin: string | undefined,
+  details: CurrentPermissionDetails | undefined,
+): boolean {
+  if (webContents && currentWebviewContents.has(webContents)) {
+    return true;
+  }
+
+  return isStoredCurrentServerSource(details?.requestingUrl) || isStoredCurrentServerSource(requestingOrigin);
+}
+
+function isAllowedCurrentPermission(
+  webContents: WebContents | null | undefined,
+  permission: string,
+  requestingOrigin: string | undefined,
+  details: CurrentPermissionDetails | undefined,
+): boolean {
+  if (!isCurrentPermissionSource(webContents, requestingOrigin, details)) {
+    return false;
+  }
+
+  if (CURRENT_MEDIA_PERMISSIONS.has(permission)) {
+    return true;
+  }
+
+  if (permission === CURRENT_READABLE_FILE_PERMISSION) {
+    return details?.fileAccessType !== 'writable' && details?.isDirectory !== true;
+  }
+
+  return false;
 }
 
 function sameOriginHttpResourceUrl(rawUrl: string, origin: string): string | undefined {
@@ -4900,10 +4948,12 @@ async function ensureCallbackServer(): Promise<number> {
 
 function configureCurrentPartition(): void {
   const currentSession = session.fromPartition(CURRENT_PARTITION);
-  currentSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    callback(CURRENT_MEDIA_PERMISSIONS.has(permission));
+  currentSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    callback(isAllowedCurrentPermission(webContents, permission, undefined, details));
   });
-  currentSession.setPermissionCheckHandler((_webContents, permission) => CURRENT_MEDIA_PERMISSIONS.has(permission));
+  currentSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) =>
+    isAllowedCurrentPermission(webContents, permission, requestingOrigin, details),
+  );
   configureDisplayCapture(currentSession, 'current');
 }
 
