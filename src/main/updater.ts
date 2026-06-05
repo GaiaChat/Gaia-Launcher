@@ -224,7 +224,11 @@ function resolveUpdateContext(currentStatus: GaiaUpdateStatus = currentState.sta
   }
 
   const installMode = resolveInstallMode();
-  const supportsInstall = installMode === 'appimage' || installMode === 'package-manager';
+  const supportsInstall =
+    installMode === 'appimage' ||
+    installMode === 'package-manager' ||
+    installMode === 'macos' ||
+    installMode === 'windows';
   return {
     ...base,
     supported: supportsInstall,
@@ -268,6 +272,12 @@ function resolveInstallMode(): GaiaUpdateInstallMode {
   if (!app.isPackaged) {
     return 'development';
   }
+  if (process.platform === 'darwin') {
+    return 'macos';
+  }
+  if (process.platform === 'win32') {
+    return 'windows';
+  }
   if (process.platform !== 'linux') {
     return 'manual';
   }
@@ -286,6 +296,12 @@ function readyMessageForInstallMode(installMode: GaiaUpdateInstallMode): string 
   }
   if (installMode === 'package-manager') {
     return 'Package updates are ready for native Linux packages.';
+  }
+  if (installMode === 'macos') {
+    return 'macOS updates are ready from Gaia releases.';
+  }
+  if (installMode === 'windows') {
+    return 'Windows updates are ready from Gaia releases.';
   }
   return 'Gaia updates are ready.';
 }

@@ -3520,6 +3520,12 @@ function updateInstallModeLabel(state: GaiaUpdateState | null): string {
   if (state.installMode === 'package-manager') {
     return 'Native package';
   }
+  if (state.installMode === 'macos') {
+    return 'macOS package';
+  }
+  if (state.installMode === 'windows') {
+    return 'Windows package';
+  }
   if (state.installMode === 'store') {
     return 'Store managed';
   }
@@ -5151,6 +5157,24 @@ function renderUpdateSettings(): DocumentFragment {
     );
   }
   fragment.append(statusCard);
+
+  const desktopCard = createSettingsCard(
+    'Desktop Builds',
+    'Gaia publishes update metadata for Windows, macOS, and Linux packages.',
+  );
+  appendSettingsRow(
+    desktopCard,
+    'Windows',
+    'Installer builds fetch beta.yml and can download updates from the latest release assets.',
+    createUpdatePill('Auto update'),
+  );
+  appendSettingsRow(
+    desktopCard,
+    'macOS',
+    'DMG and zip builds fetch beta-mac.yml from the latest release assets.',
+    createUpdatePill('Auto update'),
+  );
+  fragment.append(desktopCard);
 
   const linuxCard = createSettingsCard('Linux Builds', 'AppImage is the primary no-terminal updater across Linux desktops.');
   appendSettingsRow(

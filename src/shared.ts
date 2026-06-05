@@ -178,6 +178,8 @@ export type GaiaUpdateStatus =
 export type GaiaUpdateInstallMode =
   | 'appimage'
   | 'package-manager'
+  | 'macos'
+  | 'windows'
   | 'store'
   | 'manual'
   | 'development';
