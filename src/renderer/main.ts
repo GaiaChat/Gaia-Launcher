@@ -32,8 +32,8 @@ import type {
 } from '../shared';
 import {
   BskyDmP2PVoiceSignalingTransport,
-  decodeBskyVoiceSignalPayload,
   formatP2PVoiceSignalBundle,
+  isBskyVoiceSignalPayloadText,
   ManualP2PVoiceSignalingTransport,
   parseP2PVoiceSignalText,
   P2PVoiceCallService,
@@ -8691,7 +8691,7 @@ function renderMessagesViewport(): void {
 }
 
 function bskyMessagePreviewText(message: GaiaBskyMessage): string {
-  return decodeBskyVoiceSignalPayload(message.text).length > 0 ? 'Gaia voice call signal' : message.text;
+  return isBskyVoiceSignalPayloadText(message.text) ? 'Gaia voice call signal' : message.text;
 }
 
 function renderConvos(): void {
@@ -8777,7 +8777,7 @@ function renderMessages(): void {
     return;
   }
 
-  const visibleMessages = messages.filter((message) => decodeBskyVoiceSignalPayload(message.text).length === 0);
+  const visibleMessages = messages.filter((message) => !isBskyVoiceSignalPayloadText(message.text));
 
   if (visibleMessages.length === 0) {
     const state = document.createElement('div');

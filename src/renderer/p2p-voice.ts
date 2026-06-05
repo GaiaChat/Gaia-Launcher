@@ -14,12 +14,17 @@ export const P2P_VOICE_DIRECT_FAILURE_MESSAGE =
   'Direct P2P connection failed. This network may require a TURN relay.';
 const BSKY_VOICE_SIGNAL_TEXT_PREFIX = 'Gaia voice call signal: ';
 const BSKY_VOICE_SIGNAL_TOKEN_PREFIX = 'gaia-call:v1:';
+const BSKY_VOICE_SIGNAL_CHUNK_TOKEN_PREFIX = 'gaia-call:v1c:';
 const BSKY_VOICE_SIGNAL_APP = 'gaia-launcher';
 const BSKY_VOICE_SIGNAL_KIND = 'p2p-voice-signal';
 const BSKY_VOICE_SIGNAL_DEFAULT_POLL_MS = 1_500;
 const BSKY_VOICE_SIGNAL_DEFAULT_DEBOUNCE_MS = 350;
 const BSKY_VOICE_SIGNAL_DEFAULT_LIMIT = 50;
 const BSKY_VOICE_SIGNAL_SEEN_LIMIT = 400;
+const BSKY_VOICE_SIGNAL_MAX_TEXT_GRAPHEMES = 950;
+const BSKY_VOICE_SIGNAL_MAX_CHUNKS = 200;
+const BSKY_VOICE_SIGNAL_CHUNK_TTL_MS = 5 * 60_000;
+const BSKY_VOICE_SIGNAL_CHUNK_GROUP_LIMIT = 80;
 
 export type P2PVoicePhase =
   | 'idle'
@@ -116,6 +121,20 @@ interface PendingBskyVoiceSignal {
   reject: (error: Error) => void;
 }
 
+interface BskyVoiceSignalPayloadChunk {
+  id: string;
+  index: number;
+  total: number;
+  data: string;
+}
+
+interface IncomingBskyVoiceSignalChunkGroup {
+  total: number;
+  chunks: Map<number, string>;
+  firstSeenAt: number;
+  updatedAt: number;
+}
+
 export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransport {
   readonly mode = 'bsky-dm' as const;
 
@@ -130,6 +149,7 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
   private readonly listeners = new Set<P2PVoiceSignalListener>();
   private readonly seenMessageIds = new Set<string>();
   private readonly seenMessageOrder: string[] = [];
+  private readonly incomingChunkGroups = new Map<string, IncomingBskyVoiceSignalChunkGroup>();
   private outboundQueue: PendingBskyVoiceSignal[] = [];
   private pollTimer: number | undefined;
   private flushTimer: number | undefined;
@@ -200,6 +220,7 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
     this.listeners.clear();
     this.seenMessageIds.clear();
     this.seenMessageOrder.length = 0;
+    this.incomingChunkGroups.clear();
   }
 
   private scheduleFlush(): void {
@@ -225,18 +246,17 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
       return;
     }
     const batch = this.outboundQueue.splice(0);
-    try {
-      const text = encodeBskyVoiceSignalPayload(batch.map((item) => item.message));
-      await window.gaia.sendBskyMessage({ convoId: this.convoId, text });
-      for (const item of batch) {
+    for (const item of batch) {
+      try {
+        for (const text of encodeBskyVoiceSignalPayloadSegments([item.message])) {
+          await window.gaia.sendBskyMessage({ convoId: this.convoId, text });
+        }
         item.resolve();
-      }
-    } catch (error) {
-      const normalized = normalizeP2PVoiceError(error, 'Could not send Bluesky DM voice signal.');
-      for (const item of batch) {
+      } catch (error) {
+        const normalized = normalizeP2PVoiceError(error, 'Could not send Bluesky DM voice signal.');
         item.reject(normalized);
+        this.reportError(normalized);
       }
-      this.reportError(normalized);
     }
   }
 
@@ -276,7 +296,7 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
     if (this.localDid && message.senderDid === this.localDid) {
       return;
     }
-    const decodedMessages = decodeBskyVoiceSignalPayload(message.text);
+    const decodedMessages = this.decodeBskyVoiceSignalPayload(message);
     if (decodedMessages.length === 0) {
       return;
     }
@@ -310,6 +330,72 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
       if (expired) {
         this.seenMessageIds.delete(expired);
       }
+    }
+  }
+
+  private decodeBskyVoiceSignalPayload(message: GaiaBskyMessage): GaiaP2PVoiceSignalMessage[] {
+    const chunk = parseBskyVoiceSignalPayloadChunk(message.text);
+    if (!chunk) {
+      return decodeBskyVoiceSignalPayload(message.text);
+    }
+    return this.acceptBskyVoiceSignalPayloadChunk(chunk, message);
+  }
+
+  private acceptBskyVoiceSignalPayloadChunk(
+    chunk: BskyVoiceSignalPayloadChunk,
+    message: GaiaBskyMessage,
+  ): GaiaP2PVoiceSignalMessage[] {
+    const now = Date.now();
+    this.pruneIncomingChunks(now);
+    const groupKey = `${message.senderDid || 'unknown'}:${chunk.id}`;
+    const existing = this.incomingChunkGroups.get(groupKey);
+    const group =
+      existing && existing.total === chunk.total
+        ? existing
+        : {
+            total: chunk.total,
+            chunks: new Map<number, string>(),
+            firstSeenAt: now,
+            updatedAt: now,
+          };
+    group.chunks.set(chunk.index, chunk.data);
+    group.updatedAt = now;
+    this.incomingChunkGroups.set(groupKey, group);
+    if (group.chunks.size < group.total) {
+      return [];
+    }
+
+    let encoded = '';
+    for (let index = 1; index <= group.total; index += 1) {
+      const data = group.chunks.get(index);
+      if (!data) {
+        return [];
+      }
+      encoded += data;
+    }
+    this.incomingChunkGroups.delete(groupKey);
+    return decodeBskyVoiceSignalPayloadData(encoded);
+  }
+
+  private pruneIncomingChunks(now: number): void {
+    for (const [key, group] of this.incomingChunkGroups) {
+      if (now - group.updatedAt > BSKY_VOICE_SIGNAL_CHUNK_TTL_MS) {
+        this.incomingChunkGroups.delete(key);
+      }
+    }
+    while (this.incomingChunkGroups.size > BSKY_VOICE_SIGNAL_CHUNK_GROUP_LIMIT) {
+      let oldestKey: string | null = null;
+      let oldestSeenAt = Number.POSITIVE_INFINITY;
+      for (const [key, group] of this.incomingChunkGroups) {
+        if (group.firstSeenAt < oldestSeenAt) {
+          oldestSeenAt = group.firstSeenAt;
+          oldestKey = key;
+        }
+      }
+      if (!oldestKey) {
+        break;
+      }
+      this.incomingChunkGroups.delete(oldestKey);
     }
   }
 
@@ -364,15 +450,18 @@ export function formatP2PVoiceSignalBundle(messages: GaiaP2PVoiceSignalMessage[]
 }
 
 export function encodeBskyVoiceSignalPayload(messages: GaiaP2PVoiceSignalMessage[]): string {
-  const payload = {
-    app: BSKY_VOICE_SIGNAL_APP,
-    kind: BSKY_VOICE_SIGNAL_KIND,
-    version: 1,
+  return `${BSKY_VOICE_SIGNAL_TEXT_PREFIX}${BSKY_VOICE_SIGNAL_TOKEN_PREFIX}${encodeBskyVoiceSignalPayloadData(
     messages,
-  };
-  return `${BSKY_VOICE_SIGNAL_TEXT_PREFIX}${BSKY_VOICE_SIGNAL_TOKEN_PREFIX}${base64UrlEncode(
-    JSON.stringify(payload),
   )}`;
+}
+
+export function encodeBskyVoiceSignalPayloadSegments(messages: GaiaP2PVoiceSignalMessage[]): string[] {
+  const encoded = encodeBskyVoiceSignalPayloadData(messages);
+  const fullText = `${BSKY_VOICE_SIGNAL_TEXT_PREFIX}${BSKY_VOICE_SIGNAL_TOKEN_PREFIX}${encoded}`;
+  if (fullText.length <= BSKY_VOICE_SIGNAL_MAX_TEXT_GRAPHEMES) {
+    return [fullText];
+  }
+  return encodeBskyVoiceSignalPayloadChunks(encoded);
 }
 
 export function decodeBskyVoiceSignalPayload(text: string): GaiaP2PVoiceSignalMessage[] {
@@ -389,24 +478,14 @@ export function decodeBskyVoiceSignalPayload(text: string): GaiaP2PVoiceSignalMe
   }
 
   try {
-    const decoded = base64UrlDecode(encoded);
-    const payload = JSON.parse(decoded) as unknown;
-    if (!payload || typeof payload !== 'object') {
-      return [];
-    }
-    const record = payload as Record<string, unknown>;
-    if (
-      record.app !== BSKY_VOICE_SIGNAL_APP ||
-      record.kind !== BSKY_VOICE_SIGNAL_KIND ||
-      record.version !== 1 ||
-      !Array.isArray(record.messages)
-    ) {
-      return [];
-    }
-    return parseP2PVoiceSignalText(JSON.stringify(record.messages)).messages;
+    return decodeBskyVoiceSignalPayloadData(encoded);
   } catch {
     return [];
   }
+}
+
+export function isBskyVoiceSignalPayloadText(text: string): boolean {
+  return text.includes(BSKY_VOICE_SIGNAL_TOKEN_PREFIX) || text.includes(BSKY_VOICE_SIGNAL_CHUNK_TOKEN_PREFIX);
 }
 
 export function parseP2PVoiceSignalText(input: string): {
@@ -958,6 +1037,118 @@ function shouldFlushBskyVoiceSignalImmediately(message: GaiaP2PVoiceSignalMessag
 
 function normalizeP2PVoiceError(error: unknown, fallback: string): Error {
   return error instanceof Error ? error : new Error(fallback);
+}
+
+function encodeBskyVoiceSignalPayloadData(messages: GaiaP2PVoiceSignalMessage[]): string {
+  const payload = {
+    app: BSKY_VOICE_SIGNAL_APP,
+    kind: BSKY_VOICE_SIGNAL_KIND,
+    version: 1,
+    messages,
+  };
+  return base64UrlEncode(JSON.stringify(payload));
+}
+
+function decodeBskyVoiceSignalPayloadData(encoded: string): GaiaP2PVoiceSignalMessage[] {
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) {
+    return [];
+  }
+  try {
+    const decoded = base64UrlDecode(encoded);
+    const payload = JSON.parse(decoded) as unknown;
+    if (!payload || typeof payload !== 'object') {
+      return [];
+    }
+    const record = payload as Record<string, unknown>;
+    if (
+      record.app !== BSKY_VOICE_SIGNAL_APP ||
+      record.kind !== BSKY_VOICE_SIGNAL_KIND ||
+      record.version !== 1 ||
+      !Array.isArray(record.messages)
+    ) {
+      return [];
+    }
+    return parseP2PVoiceSignalText(JSON.stringify(record.messages)).messages;
+  } catch {
+    return [];
+  }
+}
+
+function encodeBskyVoiceSignalPayloadChunks(encoded: string): string[] {
+  const chunkId = createBskyVoiceSignalChunkId();
+  let chunkLength = BSKY_VOICE_SIGNAL_MAX_TEXT_GRAPHEMES - chunkTextPrefix(chunkId, 1, 1).length;
+  if (chunkLength <= 0) {
+    throw new Error('Bluesky DM voice signal chunk metadata is too large.');
+  }
+
+  while (true) {
+    const total = Math.ceil(encoded.length / chunkLength);
+    if (total > BSKY_VOICE_SIGNAL_MAX_CHUNKS) {
+      throw new Error('Bluesky DM voice signal is too large to relay safely.');
+    }
+    const adjustedChunkLength = BSKY_VOICE_SIGNAL_MAX_TEXT_GRAPHEMES - chunkTextPrefix(chunkId, total, total).length;
+    if (adjustedChunkLength <= 0) {
+      throw new Error('Bluesky DM voice signal chunk metadata is too large.');
+    }
+    if (adjustedChunkLength >= chunkLength) {
+      break;
+    }
+    chunkLength = adjustedChunkLength;
+  }
+
+  const chunks: string[] = [];
+  const total = Math.ceil(encoded.length / chunkLength);
+  for (let index = 1; index <= total; index += 1) {
+    const start = (index - 1) * chunkLength;
+    const chunk = encoded.slice(start, start + chunkLength);
+    chunks.push(`${chunkTextPrefix(chunkId, index, total)}${chunk}`);
+  }
+  return chunks;
+}
+
+function chunkTextPrefix(chunkId: string, index: number, total: number): string {
+  return `${BSKY_VOICE_SIGNAL_TEXT_PREFIX}${BSKY_VOICE_SIGNAL_CHUNK_TOKEN_PREFIX}${chunkId}:${index}:${total}:`;
+}
+
+function parseBskyVoiceSignalPayloadChunk(text: string): BskyVoiceSignalPayloadChunk | null {
+  const markerIndex = text.indexOf(BSKY_VOICE_SIGNAL_CHUNK_TOKEN_PREFIX);
+  if (markerIndex < 0) {
+    return null;
+  }
+  const token = text
+    .slice(markerIndex + BSKY_VOICE_SIGNAL_CHUNK_TOKEN_PREFIX.length)
+    .trim()
+    .split(/\s+/)[0];
+  const match = /^([A-Za-z0-9_-]+):([1-9][0-9]*):([1-9][0-9]*):([A-Za-z0-9_-]+)$/.exec(token);
+  if (!match) {
+    return null;
+  }
+  const index = Number.parseInt(match[2], 10);
+  const total = Number.parseInt(match[3], 10);
+  if (
+    !Number.isSafeInteger(index) ||
+    !Number.isSafeInteger(total) ||
+    total < 2 ||
+    total > BSKY_VOICE_SIGNAL_MAX_CHUNKS ||
+    index > total
+  ) {
+    return null;
+  }
+  return {
+    id: match[1],
+    index,
+    total,
+    data: match[4],
+  };
+}
+
+function createBskyVoiceSignalChunkId(): string {
+  const bytes = new Uint8Array(9);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(36).padStart(2, '0')).join('');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
 }
 
 function base64UrlEncode(value: string): string {
