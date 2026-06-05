@@ -31,11 +31,15 @@ import type {
   GaiaVideoSettings,
 } from '../shared';
 import {
+  BskyDmP2PVoiceSignalingTransport,
+  decodeBskyVoiceSignalPayload,
   formatP2PVoiceSignalBundle,
   ManualP2PVoiceSignalingTransport,
   parseP2PVoiceSignalText,
   P2PVoiceCallService,
   P2P_VOICE_DIRECT_FAILURE_MESSAGE,
+  type P2PVoiceSignalSource,
+  type P2PVoiceSignalingTransport,
   type P2PVoiceState,
 } from './p2p-voice';
 import { createElement, type CSSProperties } from 'react';
@@ -74,6 +78,8 @@ const GIF_QUICK_TOPICS = [
 ];
 const MAX_GIF_RESULTS = 9;
 const MESSAGES_AUTO_REFRESH_MS = 12_000;
+const BSKY_DM_VOICE_SIGNAL_POLL_MS = 1_500;
+const BSKY_DM_VOICE_SIGNAL_STALE_MS = 5 * 60_000;
 const BSKY_NOTIFICATION_TRACK_LIMIT = 200;
 const LAUNCHER_UPDATE_STARTUP_CHECK_DELAY_MS = 8_000;
 const LAUNCHER_UPDATE_LIVE_CHECK_INTERVAL_MS = 60 * 60_000;
@@ -221,6 +227,21 @@ type AudioDeviceChoice = {
   label: string;
   kind: 'audioinput' | 'audiooutput';
 };
+type IncomingP2PVoiceOffer = {
+  convoId: string;
+  message: Extract<GaiaP2PVoiceSignalMessage, { type: 'offer' }>;
+  sourceMessageId?: string;
+  receivedAt: string;
+};
+type P2PVoiceActionInFlight =
+  | 'join'
+  | 'leave'
+  | 'mute'
+  | 'apply-signal'
+  | 'copy-signal'
+  | 'accept'
+  | 'reject'
+  | null;
 type VideoDeviceChoice = {
   deviceId: string;
   label: string;
@@ -683,6 +704,22 @@ root.innerHTML = `
                 </svg>
               </button>
             </header>
+            <section class="incoming-call-panel hidden" id="p2pIncomingCallPanel" aria-label="Incoming P2P voice call">
+              <div class="incoming-call-avatar" id="p2pIncomingCallAvatar"></div>
+              <div class="incoming-call-copy">
+                <span>Incoming call</span>
+                <strong id="p2pIncomingCallTitle">Direct call</strong>
+                <p id="p2pIncomingCallSubtitle">Bluesky DM signaling, WebRTC audio.</p>
+              </div>
+              <div class="incoming-call-actions">
+                <button class="direct-call-control direct-call-start" id="p2pAcceptCallButton" type="button">
+                  <span>Accept</span>
+                </button>
+                <button class="direct-call-control direct-call-end" id="p2pRejectCallButton" type="button">
+                  <span>Reject</span>
+                </button>
+              </div>
+            </section>
             <section class="direct-call-panel hidden" id="p2pCallPanel" aria-label="Direct P2P voice call">
               <button class="direct-call-close" id="p2pCallCloseButton" type="button" aria-label="Close call panel">×</button>
               <div class="direct-call-hero">
@@ -710,7 +747,7 @@ root.innerHTML = `
                   <span>End</span>
                 </button>
               </div>
-              <details class="direct-call-signaling">
+              <details class="direct-call-signaling" id="p2pManualSignalingDetails">
                 <summary>Manual signaling</summary>
                 <div class="direct-call-signal-grid">
                   <label>
@@ -943,6 +980,12 @@ const messagesButton = document.querySelector<HTMLButtonElement>('#messagesButto
 const messagesView = document.querySelector<HTMLElement>('#messagesView')!;
 const messageThread = document.querySelector<HTMLElement>('#messageThread')!;
 const messageCallButton = document.querySelector<HTMLButtonElement>('#messageCallButton')!;
+const p2pIncomingCallPanel = document.querySelector<HTMLElement>('#p2pIncomingCallPanel')!;
+const p2pIncomingCallAvatar = document.querySelector<HTMLDivElement>('#p2pIncomingCallAvatar')!;
+const p2pIncomingCallTitle = document.querySelector<HTMLElement>('#p2pIncomingCallTitle')!;
+const p2pIncomingCallSubtitle = document.querySelector<HTMLElement>('#p2pIncomingCallSubtitle')!;
+const p2pAcceptCallButton = document.querySelector<HTMLButtonElement>('#p2pAcceptCallButton')!;
+const p2pRejectCallButton = document.querySelector<HTMLButtonElement>('#p2pRejectCallButton')!;
 const p2pCallPanel = document.querySelector<HTMLElement>('#p2pCallPanel')!;
 const p2pCallCloseButton = document.querySelector<HTMLButtonElement>('#p2pCallCloseButton')!;
 const p2pCallAvatar = document.querySelector<HTMLDivElement>('#p2pCallAvatar')!;
@@ -957,6 +1000,7 @@ const p2pLocalMicState = document.querySelector<HTMLElement>('#p2pLocalMicState'
 const p2pRemoteAudioState = document.querySelector<HTMLElement>('#p2pRemoteAudioState')!;
 const p2pLocalSignalOutput = document.querySelector<HTMLTextAreaElement>('#p2pLocalSignalOutput')!;
 const p2pPeerSignalInput = document.querySelector<HTMLTextAreaElement>('#p2pPeerSignalInput')!;
+const p2pManualSignalingDetails = document.querySelector<HTMLDetailsElement>('#p2pManualSignalingDetails')!;
 const p2pCopySignalButton = document.querySelector<HTMLButtonElement>('#p2pCopySignalButton')!;
 const p2pClearSignalButton = document.querySelector<HTMLButtonElement>('#p2pClearSignalButton')!;
 const p2pApplySignalButton = document.querySelector<HTMLButtonElement>('#p2pApplySignalButton')!;
@@ -1075,16 +1119,24 @@ let spotifyStatus: GaiaSpotifyStatus = {
   scope: 'user-read-currently-playing',
 };
 let spotifyActionInFlight: 'connect' | 'sharing' | 'disconnect' | 'copy' | null = null;
-const p2pVoiceSignaling = new ManualP2PVoiceSignalingTransport(handleP2PVoiceOutboundSignal);
-const p2pVoiceService = new P2PVoiceCallService({
+let p2pVoiceSignaling: P2PVoiceSignalingTransport = new ManualP2PVoiceSignalingTransport(handleP2PVoiceOutboundSignal);
+let p2pVoiceSignalingConvoId: string | null = null;
+let p2pVoiceService = new P2PVoiceCallService({
   signaling: p2pVoiceSignaling,
   iceConfig: p2pVoiceIceConfigFromSettings(DEFAULT_P2P_VOICE_SETTINGS),
 });
 let p2pVoiceState: P2PVoiceState = p2pVoiceService.getState();
 let p2pVoiceOutboundSignals: GaiaP2PVoiceSignalMessage[] = [];
-let p2pVoiceActionInFlight: 'join' | 'leave' | 'mute' | 'apply-signal' | 'copy-signal' | null = null;
+let p2pVoiceActionInFlight: P2PVoiceActionInFlight = null;
+let p2pVoiceStateUnsubscribe: (() => void) | null = null;
+let p2pVoiceRemoteStreamUnsubscribe: (() => void) | null = null;
 let p2pDirectCallOpen = false;
 let p2pDirectCallConvoId: string | null = null;
+let p2pBskyMonitorTransport: BskyDmP2PVoiceSignalingTransport | null = null;
+let p2pBskyMonitorUnsubscribe: (() => void) | null = null;
+let p2pBskyMonitorConvoId: string | null = null;
+let p2pBskyMonitorLocalDid: string | null = null;
+let incomingP2PVoiceOffer: IncomingP2PVoiceOffer | null = null;
 let microphoneTestState: MicrophoneTestState = 'idle';
 let microphoneTestMessage = 'Start a local mic test to check the selected input.';
 let microphoneTestLevel = 0;
@@ -4137,6 +4189,323 @@ async function copySpotifyRedirectUri(): Promise<void> {
   }
 }
 
+function bindP2PVoiceService(service: P2PVoiceCallService): void {
+  p2pVoiceStateUnsubscribe?.();
+  p2pVoiceRemoteStreamUnsubscribe?.();
+  p2pVoiceState = service.getState();
+  p2pVoiceStateUnsubscribe = service.subscribe((state) => {
+    p2pVoiceState = state;
+    renderIncomingP2PVoicePrompt();
+    if (p2pDirectCallOpen) {
+      renderP2PDirectCallPanel();
+    }
+    if (
+      state.signalingMode === 'bsky-dm' &&
+      p2pVoiceCanJoin(state) &&
+      p2pVoiceActionInFlight !== 'join' &&
+      p2pVoiceActionInFlight !== 'accept'
+    ) {
+      window.setTimeout(() => {
+        resetIdleBskyDmP2PVoiceService();
+      }, 0);
+    }
+  });
+  p2pVoiceRemoteStreamUnsubscribe = service.onRemoteStream((stream) => {
+    p2pRemoteAudio.srcObject = stream;
+    if (stream) {
+      void p2pRemoteAudio.play().catch(() => undefined);
+    }
+    if (p2pDirectCallOpen) {
+      renderP2PDirectCallPanel();
+    }
+  });
+}
+
+function replaceP2PVoiceService(
+  signaling: P2PVoiceSignalingTransport,
+  signalingConvoId: string | null,
+): void {
+  p2pVoiceStateUnsubscribe?.();
+  p2pVoiceRemoteStreamUnsubscribe?.();
+  p2pVoiceStateUnsubscribe = null;
+  p2pVoiceRemoteStreamUnsubscribe = null;
+  p2pVoiceService.destroy();
+  p2pRemoteAudio.srcObject = null;
+  p2pVoiceSignaling = signaling;
+  p2pVoiceSignalingConvoId = signalingConvoId;
+  if (signaling.mode !== 'manual') {
+    p2pVoiceOutboundSignals = [];
+    syncP2PVoiceSignalOutput();
+  }
+  p2pVoiceService = new P2PVoiceCallService({
+    signaling,
+    iceConfig: p2pVoiceIceConfigFromSettings(currentSettings().p2pVoice),
+    roomId: signalingConvoId ? `bsky-dm:${signalingConvoId}` : undefined,
+  });
+  bindP2PVoiceService(p2pVoiceService);
+}
+
+function resetP2PVoiceServiceToManual(): void {
+  replaceP2PVoiceService(new ManualP2PVoiceSignalingTransport(handleP2PVoiceOutboundSignal), null);
+}
+
+function resetIdleBskyDmP2PVoiceService(): void {
+  if (
+    p2pVoiceState.signalingMode !== 'bsky-dm' ||
+    !p2pVoiceCanJoin() ||
+    p2pVoiceActionInFlight === 'join' ||
+    p2pVoiceActionInFlight === 'accept'
+  ) {
+    return;
+  }
+  resetP2PVoiceServiceToManual();
+  if (p2pDirectCallOpen) {
+    renderP2PDirectCallPanel();
+  }
+}
+
+function createBskyDmP2PVoiceTransport(
+  convoId: string,
+  options: {
+    processExistingMessages?: boolean;
+    ignoreSignalsBefore?: number;
+    seenMessageIds?: string[];
+    reportErrors?: boolean;
+  } = {},
+): BskyDmP2PVoiceSignalingTransport {
+  return new BskyDmP2PVoiceSignalingTransport({
+    convoId,
+    localDid: clientAuthStatus.profile?.did,
+    pollIntervalMs: BSKY_DM_VOICE_SIGNAL_POLL_MS,
+    processExistingMessages: options.processExistingMessages,
+    ignoreSignalsBefore: options.ignoreSignalsBefore ?? Date.now() - BSKY_DM_VOICE_SIGNAL_STALE_MS,
+    seenMessageIds: options.seenMessageIds,
+    onError:
+      options.reportErrors === false
+        ? undefined
+        : (error) => {
+            if (p2pDirectCallOpen || p2pVoiceState.signalingMode === 'bsky-dm') {
+              setStatus(error.message, 'bad');
+            }
+          },
+  });
+}
+
+function ensureBskyDmP2PVoiceService(
+  convoId: string,
+  options: {
+    ignoreSignalsBefore?: number;
+    seenMessageIds?: string[];
+  } = {},
+): void {
+  if (p2pVoiceSignaling.mode === 'bsky-dm' && p2pVoiceSignalingConvoId === convoId) {
+    return;
+  }
+  replaceP2PVoiceService(
+    createBskyDmP2PVoiceTransport(convoId, {
+      processExistingMessages: true,
+      ignoreSignalsBefore: options.ignoreSignalsBefore,
+      seenMessageIds: options.seenMessageIds,
+    }),
+    convoId,
+  );
+}
+
+function closeBskyDmVoiceMonitor(): void {
+  p2pBskyMonitorUnsubscribe?.();
+  p2pBskyMonitorUnsubscribe = null;
+  p2pBskyMonitorTransport?.close();
+  p2pBskyMonitorTransport = null;
+  p2pBskyMonitorConvoId = null;
+  p2pBskyMonitorLocalDid = null;
+}
+
+function syncBskyDmVoiceMonitor(): void {
+  const convo = selectedConvo();
+  const localDid = clientAuthStatus.profile?.did ?? null;
+  const nextConvoId = clientAuthStatus.authenticated && localDid && convo && isOneToOneBskyConvo(convo)
+    ? convo.id
+    : null;
+  if (!nextConvoId || !localDid) {
+    closeBskyDmVoiceMonitor();
+    return;
+  }
+  if (p2pBskyMonitorConvoId === nextConvoId && p2pBskyMonitorLocalDid === localDid) {
+    return;
+  }
+  closeBskyDmVoiceMonitor();
+  try {
+    const transport = createBskyDmP2PVoiceTransport(nextConvoId, {
+      processExistingMessages: false,
+      reportErrors: false,
+    });
+    p2pBskyMonitorTransport = transport;
+    p2pBskyMonitorConvoId = nextConvoId;
+    p2pBskyMonitorLocalDid = localDid;
+    p2pBskyMonitorUnsubscribe = transport.subscribe((message, source) => {
+      handleBskyDmVoiceMonitorSignal(nextConvoId, message, source);
+    });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not start Bluesky DM voice polling.', 'bad');
+  }
+}
+
+function isOneToOneBskyConvo(convo: GaiaBskyConvo): boolean {
+  return conversationMembers(convo).length === 1;
+}
+
+function handleBskyDmVoiceMonitorSignal(
+  convoId: string,
+  message: GaiaP2PVoiceSignalMessage,
+  source?: P2PVoiceSignalSource,
+): void {
+  if (selectedConvoId !== convoId) {
+    return;
+  }
+  if (message.type === 'call-ended' || message.type === 'leave-call' || message.type === 'call-rejected') {
+    if (incomingP2PVoiceOffer?.message.callId === message.callId) {
+      incomingP2PVoiceOffer = null;
+      renderIncomingP2PVoicePrompt();
+    }
+    return;
+  }
+  if (message.type !== 'offer') {
+    return;
+  }
+  if (incomingP2PVoiceOffer?.message.callId === message.callId) {
+    return;
+  }
+  if (!p2pVoiceCanJoin()) {
+    if (message.callId !== p2pVoiceState.callId) {
+      void sendBskyDmP2PVoiceControlSignal(convoId, message, 'call-rejected', 'Already in a call.');
+    }
+    return;
+  }
+  incomingP2PVoiceOffer = {
+    convoId,
+    message,
+    sourceMessageId: source?.messageId,
+    receivedAt: new Date().toISOString(),
+  };
+  setStatus('Incoming P2P voice call', 'neutral');
+  renderMessagesViewport();
+}
+
+function renderIncomingP2PVoicePrompt(): void {
+  const incoming = incomingP2PVoiceOffer;
+  const convo = incoming ? convos.find((item) => item.id === incoming.convoId) : undefined;
+  const visible = Boolean(incoming && convo && selectedConvoId === incoming.convoId && clientAuthStatus.authenticated);
+  p2pIncomingCallPanel.classList.toggle('hidden', !visible);
+  messageThread.classList.toggle('incoming-call-open', visible);
+  if (!visible || !incoming || !convo) {
+    return;
+  }
+
+  const busy = p2pVoiceActionInFlight === 'accept' || p2pVoiceActionInFlight === 'reject';
+  const title = convoTitle(convo);
+  p2pIncomingCallAvatar.replaceChildren(buildAvatar(convoPrimaryActor(convo), title, 'md'));
+  p2pIncomingCallTitle.textContent = title;
+  p2pIncomingCallSubtitle.textContent = 'Direct P2P voice call via Bluesky DM signaling.';
+  p2pAcceptCallButton.disabled = busy || !p2pVoiceCanJoin();
+  p2pRejectCallButton.disabled = busy;
+  p2pAcceptCallButton.querySelector('span')!.textContent =
+    p2pVoiceActionInFlight === 'accept' ? 'Accepting...' : 'Accept';
+  p2pRejectCallButton.querySelector('span')!.textContent =
+    p2pVoiceActionInFlight === 'reject' ? 'Rejecting...' : 'Reject';
+}
+
+async function acceptIncomingP2PVoiceCall(): Promise<void> {
+  const incoming = incomingP2PVoiceOffer;
+  if (!incoming) {
+    return;
+  }
+  if (!p2pVoiceCanJoin()) {
+    setStatus('End the current call before accepting another one.', 'warn');
+    return;
+  }
+
+  p2pVoiceActionInFlight = 'accept';
+  renderIncomingP2PVoicePrompt();
+  try {
+    selectedConvoId = incoming.convoId;
+    p2pDirectCallOpen = true;
+    p2pDirectCallConvoId = incoming.convoId;
+    const createdAt = Date.parse(incoming.message.createdAt);
+    ensureBskyDmP2PVoiceService(incoming.convoId, {
+      ignoreSignalsBefore: Number.isFinite(createdAt) ? createdAt - 5_000 : Date.now() - BSKY_DM_VOICE_SIGNAL_STALE_MS,
+      seenMessageIds: incoming.sourceMessageId ? [incoming.sourceMessageId] : undefined,
+    });
+    incomingP2PVoiceOffer = null;
+    renderMessagesViewport();
+    await p2pVoiceService.receiveSignal(incoming.message);
+    setStatus('P2P voice answer sent', 'good');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not accept P2P voice call.', 'bad');
+  } finally {
+    p2pVoiceActionInFlight = null;
+    resetIdleBskyDmP2PVoiceService();
+    renderMessagesViewport();
+  }
+}
+
+async function rejectIncomingP2PVoiceCall(): Promise<void> {
+  const incoming = incomingP2PVoiceOffer;
+  if (!incoming) {
+    return;
+  }
+
+  p2pVoiceActionInFlight = 'reject';
+  renderIncomingP2PVoicePrompt();
+  try {
+    await sendBskyDmP2PVoiceControlSignal(incoming.convoId, incoming.message, 'call-rejected', 'Call rejected.');
+    if (incomingP2PVoiceOffer?.message.callId === incoming.message.callId) {
+      incomingP2PVoiceOffer = null;
+    }
+    setStatus('Call rejected', 'warn');
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not reject P2P voice call.', 'bad');
+  } finally {
+    p2pVoiceActionInFlight = null;
+    renderMessagesViewport();
+  }
+}
+
+async function sendBskyDmP2PVoiceControlSignal(
+  convoId: string,
+  source: GaiaP2PVoiceSignalMessage,
+  type: 'call-rejected',
+  reason: string,
+): Promise<void> {
+  const signal = {
+    version: 1,
+    type,
+    callId: source.callId,
+    roomId: source.roomId,
+    senderId: p2pVoiceState.localPeerId,
+    createdAt: new Date().toISOString(),
+    reason,
+  } as GaiaP2PVoiceSignalMessage;
+
+  if (p2pBskyMonitorTransport && p2pBskyMonitorConvoId === convoId) {
+    await p2pBskyMonitorTransport.send(signal);
+    return;
+  }
+  if (p2pVoiceSignaling.mode === 'bsky-dm' && p2pVoiceSignalingConvoId === convoId) {
+    await p2pVoiceSignaling.send(signal);
+    return;
+  }
+
+  const transport = createBskyDmP2PVoiceTransport(convoId, {
+    processExistingMessages: false,
+    reportErrors: false,
+  });
+  try {
+    await transport.send(signal);
+  } finally {
+    transport.close();
+  }
+}
+
 function handleP2PVoiceOutboundSignal(message: GaiaP2PVoiceSignalMessage): void {
   p2pVoiceOutboundSignals.push(message);
   if (p2pVoiceOutboundSignals.length > 100) {
@@ -4157,10 +4526,18 @@ function p2pVoiceCanLeave(state = p2pVoiceState): boolean {
 }
 
 function p2pVoiceModeLabel(state = p2pVoiceState): string {
+  if (state.signalingMode === 'bsky-dm') {
+    return state.usingTurn ? 'Bluesky DM + TURN optional' : 'Bluesky DM signaling';
+  }
   return state.usingTurn ? 'Direct P2P + optional TURN' : 'STUN-only';
 }
 
 function p2pVoiceTransportLabelText(state = p2pVoiceState): string {
+  if (state.signalingMode === 'bsky-dm') {
+    return state.usingTurn
+      ? 'WebRTC P2P media, Bluesky DM signaling, optional TURN config available'
+      : 'WebRTC P2P media, Bluesky DM signaling, STUN-only ICE';
+  }
   return state.usingTurn
     ? 'Direct P2P first, with optional community TURN config available'
     : 'Direct P2P / STUN-only';
@@ -4185,12 +4562,20 @@ function renderP2PCallAvatar(): void {
 }
 
 function renderP2PDirectCallPanel(): void {
-  const canCall = clientAuthStatus.authenticated && Boolean(selectedConvoId);
-  messageCallButton.disabled = !canCall;
+  const convo = selectedConvo();
+  const canCall = clientAuthStatus.authenticated && Boolean(convo && isOneToOneBskyConvo(convo));
+  const incomingForCurrentConvo = incomingP2PVoiceOffer?.convoId === selectedConvoId;
+  messageCallButton.disabled = !canCall || incomingForCurrentConvo;
   messageCallButton.classList.toggle('active', p2pDirectCallOpen);
   messageCallButton.setAttribute('aria-pressed', p2pDirectCallOpen ? 'true' : 'false');
+  messageCallButton.title = incomingForCurrentConvo
+    ? 'Accept or reject the incoming call'
+    : canCall
+      ? 'Start P2P voice call'
+      : 'Calls are available in 1:1 Bluesky DMs';
   p2pCallPanel.classList.toggle('hidden', !p2pDirectCallOpen);
   messageThread.classList.toggle('direct-call-open', p2pDirectCallOpen);
+  p2pManualSignalingDetails.hidden = p2pVoiceState.signalingMode !== 'manual';
   if (!p2pDirectCallOpen) {
     return;
   }
@@ -4207,7 +4592,7 @@ function renderP2PDirectCallPanel(): void {
   p2pVoiceError.classList.toggle('hidden', !error);
   p2pVoiceTransportLabel.textContent = p2pVoiceTransportLabelText();
 
-  p2pJoinVoiceButton.disabled = busy || !p2pVoiceCanJoin();
+  p2pJoinVoiceButton.disabled = busy || incomingForCurrentConvo || !p2pVoiceCanJoin();
   p2pJoinVoiceButton.querySelector('span')!.textContent =
     p2pVoiceActionInFlight === 'join' ? 'Calling...' : 'Start Call';
   p2pLeaveVoiceButton.disabled = busy || !p2pVoiceCanLeave();
@@ -4234,12 +4619,23 @@ function renderP2PDirectCallPanel(): void {
 }
 
 function openP2PDirectCall(autoJoin = false): void {
-  if (!selectedConvoId) {
+  const convo = selectedConvo();
+  if (!selectedConvoId || !convo) {
     setStatus('Select a conversation before starting a call.', 'warn');
+    return;
+  }
+  if (!isOneToOneBskyConvo(convo)) {
+    setStatus('Calls are available in 1:1 Bluesky DMs.', 'warn');
+    return;
+  }
+  if (incomingP2PVoiceOffer?.convoId === selectedConvoId) {
+    setStatus('Accept or reject the incoming call first.', 'warn');
+    renderIncomingP2PVoicePrompt();
     return;
   }
   p2pDirectCallOpen = true;
   p2pDirectCallConvoId = selectedConvoId;
+  incomingP2PVoiceOffer = incomingP2PVoiceOffer?.convoId === selectedConvoId ? incomingP2PVoiceOffer : null;
   renderP2PDirectCallPanel();
   if (autoJoin && p2pVoiceCanJoin()) {
     void joinP2PVoice();
@@ -4264,6 +4660,7 @@ function syncP2PDirectCallConversation(nextConvoId: string | null): void {
   }
   p2pDirectCallOpen = false;
   p2pDirectCallConvoId = null;
+  resetP2PVoiceServiceToManual();
 }
 
 function updateP2PVoiceTurnDraft(patch: Partial<GaiaP2PVoiceSettings['turnServers'][number]>): void {
@@ -4326,7 +4723,14 @@ async function joinP2PVoice(): Promise<void> {
   if (!p2pDirectCallOpen) {
     openP2PDirectCall(false);
   }
+  if (!selectedConvoId) {
+    setStatus('Select a conversation before starting a call.', 'warn');
+    return;
+  }
   p2pVoiceActionInFlight = 'join';
+  ensureBskyDmP2PVoiceService(selectedConvoId, {
+    ignoreSignalsBefore: Date.now() - BSKY_DM_VOICE_SIGNAL_STALE_MS,
+  });
   renderP2PDirectCallPanel();
   try {
     await p2pVoiceService.joinVoice();
@@ -4336,6 +4740,7 @@ async function joinP2PVoice(): Promise<void> {
     setStatus(message, 'bad');
   } finally {
     p2pVoiceActionInFlight = null;
+    resetIdleBskyDmP2PVoiceService();
     renderP2PDirectCallPanel();
   }
 }
@@ -4386,6 +4791,10 @@ function clearP2PVoiceSignal(): void {
 }
 
 async function applyP2PVoiceSignal(): Promise<void> {
+  if (!(p2pVoiceSignaling instanceof ManualP2PVoiceSignalingTransport)) {
+    setStatus('Manual signaling is not active for this call.', 'warn');
+    return;
+  }
   p2pVoiceActionInFlight = 'apply-signal';
   renderP2PDirectCallPanel();
   try {
@@ -8247,12 +8656,18 @@ function renderMessagesViewport(): void {
   messageComposerInput.disabled = !convo;
   messageSendButton.disabled = !convo || messageComposerInput.value.trim().length === 0;
   syncP2PDirectCallConversation(selectedConvoId);
+  syncBskyDmVoiceMonitor();
+  renderIncomingP2PVoicePrompt();
   renderP2PDirectCallPanel();
 
   renderConvos();
   renderMessages();
   renderFloatingLiquidGlassSurfaces();
   refreshLiquidGlassSurfaceSizes();
+}
+
+function bskyMessagePreviewText(message: GaiaBskyMessage): string {
+  return decodeBskyVoiceSignalPayload(message.text).length > 0 ? 'Gaia voice call signal' : message.text;
 }
 
 function renderConvos(): void {
@@ -8295,7 +8710,8 @@ function renderConvos(): void {
         : convo.lastMessage
           ? `${displayActor(actorForConvoDid(convo, convo.lastMessage.senderDid))}: `
           : '';
-    preview.textContent = convo.lastMessage?.text ? `${senderPrefix}${convo.lastMessage.text}` : 'No message preview';
+    const previewText = convo.lastMessage ? bskyMessagePreviewText(convo.lastMessage) : '';
+    preview.textContent = previewText ? `${senderPrefix}${previewText}` : 'No message preview';
     copy.append(title, meta, preview);
 
     const unread = document.createElement('span');
@@ -8337,7 +8753,9 @@ function renderMessages(): void {
     return;
   }
 
-  if (messages.length === 0) {
+  const visibleMessages = messages.filter((message) => decodeBskyVoiceSignalPayload(message.text).length === 0);
+
+  if (visibleMessages.length === 0) {
     const state = document.createElement('div');
     state.className = 'messages-empty';
     state.textContent = 'No messages yet.';
@@ -8346,7 +8764,7 @@ function renderMessages(): void {
   }
 
   const fragment = document.createDocumentFragment();
-  for (const message of messages) {
+  for (const message of visibleMessages) {
     const own = message.senderDid === clientAuthStatus.profile?.did;
     const senderActor = actorForDid(message.senderDid);
     const label = messageSenderLabel(message);
@@ -9465,6 +9883,12 @@ messagesButton.addEventListener('click', () => {
 messageCallButton.addEventListener('click', () => {
   openP2PDirectCall(true);
 });
+p2pAcceptCallButton.addEventListener('click', () => {
+  void acceptIncomingP2PVoiceCall();
+});
+p2pRejectCallButton.addEventListener('click', () => {
+  void rejectIncomingP2PVoiceCall();
+});
 p2pCallCloseButton.addEventListener('click', () => {
   closeP2PDirectCall({ leave: false });
 });
@@ -9672,21 +10096,7 @@ window.gaia.onUpdateStateChanged((state) => {
     renderSettingsWorkspace();
   }
 });
-p2pVoiceService.subscribe((state) => {
-  p2pVoiceState = state;
-  if (p2pDirectCallOpen) {
-    renderP2PDirectCallPanel();
-  }
-});
-p2pVoiceService.onRemoteStream((stream) => {
-  p2pRemoteAudio.srcObject = stream;
-  if (stream) {
-    void p2pRemoteAudio.play().catch(() => undefined);
-  }
-  if (p2pDirectCallOpen) {
-    renderP2PDirectCallPanel();
-  }
-});
+bindP2PVoiceService(p2pVoiceService);
 
 window.addEventListener('focus', () => {
   void maybeCheckForLauncherUpdates(LAUNCHER_UPDATE_FOCUS_CHECK_INTERVAL_MS);
@@ -9697,6 +10107,7 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 window.addEventListener('beforeunload', () => {
+  closeBskyDmVoiceMonitor();
   p2pVoiceService.destroy();
 });
 

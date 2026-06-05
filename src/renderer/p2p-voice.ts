@@ -1,5 +1,6 @@
 import {
   GAIA_P2P_VOICE_DEFAULT_STUN_URLS,
+  type GaiaBskyMessage,
   type GaiaP2PVoiceControlSignal,
   type GaiaP2PVoiceIceCandidate,
   type GaiaP2PVoiceIceConfig,
@@ -11,6 +12,14 @@ import {
 
 export const P2P_VOICE_DIRECT_FAILURE_MESSAGE =
   'Direct P2P connection failed. This network may require a TURN relay.';
+const BSKY_VOICE_SIGNAL_TEXT_PREFIX = 'Gaia voice call signal: ';
+const BSKY_VOICE_SIGNAL_TOKEN_PREFIX = 'gaia-call:v1:';
+const BSKY_VOICE_SIGNAL_APP = 'gaia-launcher';
+const BSKY_VOICE_SIGNAL_KIND = 'p2p-voice-signal';
+const BSKY_VOICE_SIGNAL_DEFAULT_POLL_MS = 1_500;
+const BSKY_VOICE_SIGNAL_DEFAULT_DEBOUNCE_MS = 350;
+const BSKY_VOICE_SIGNAL_DEFAULT_LIMIT = 50;
+const BSKY_VOICE_SIGNAL_SEEN_LIMIT = 400;
 
 export type P2PVoicePhase =
   | 'idle'
@@ -33,19 +42,29 @@ export interface P2PVoiceState {
   localStreamActive: boolean;
   remoteStreamActive: boolean;
   usingTurn: boolean;
-  signalingMode: 'manual';
+  signalingMode: P2PVoiceSignalingMode;
   connectionState?: RTCPeerConnectionState;
   iceConnectionState?: RTCIceConnectionState;
   error?: string;
 }
 
+export type P2PVoiceSignalingMode = 'manual' | 'bsky-dm';
 export type P2PVoiceStateListener = (state: P2PVoiceState) => void;
 export type P2PVoiceRemoteStreamListener = (stream: MediaStream | null) => void;
-export type P2PVoiceSignalListener = (message: GaiaP2PVoiceSignalMessage) => void;
+export interface P2PVoiceSignalSource {
+  convoId?: string;
+  messageId?: string;
+  senderDid?: string;
+  sentAt?: string;
+}
+export type P2PVoiceSignalListener = (
+  message: GaiaP2PVoiceSignalMessage,
+  source?: P2PVoiceSignalSource,
+) => void;
 
 export interface P2PVoiceSignalingTransport {
-  readonly mode: 'manual';
-  send(message: GaiaP2PVoiceSignalMessage): void;
+  readonly mode: P2PVoiceSignalingMode;
+  send(message: GaiaP2PVoiceSignalMessage): void | Promise<void>;
   subscribe(listener: P2PVoiceSignalListener): () => void;
   close(): void;
 }
@@ -76,6 +95,226 @@ export class ManualP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
 
   close(): void {
     this.listeners.clear();
+  }
+}
+
+export interface BskyDmP2PVoiceSignalingTransportOptions {
+  convoId: string;
+  localDid?: string;
+  pollIntervalMs?: number;
+  sendDebounceMs?: number;
+  messageLimit?: number;
+  processExistingMessages?: boolean;
+  ignoreSignalsBefore?: number;
+  seenMessageIds?: string[];
+  onError?: (error: Error) => void;
+}
+
+interface PendingBskyVoiceSignal {
+  message: GaiaP2PVoiceSignalMessage;
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransport {
+  readonly mode = 'bsky-dm' as const;
+
+  private readonly convoId: string;
+  private readonly localDid?: string;
+  private readonly pollIntervalMs: number;
+  private readonly sendDebounceMs: number;
+  private readonly messageLimit: number;
+  private readonly processExistingMessages: boolean;
+  private readonly ignoreSignalsBefore: number;
+  private readonly onError?: (error: Error) => void;
+  private readonly listeners = new Set<P2PVoiceSignalListener>();
+  private readonly seenMessageIds = new Set<string>();
+  private readonly seenMessageOrder: string[] = [];
+  private outboundQueue: PendingBskyVoiceSignal[] = [];
+  private pollTimer: number | undefined;
+  private flushTimer: number | undefined;
+  private pollInFlight = false;
+  private initialized = false;
+  private closed = false;
+
+  constructor(options: BskyDmP2PVoiceSignalingTransportOptions) {
+    const convoId = options.convoId.trim();
+    if (!convoId) {
+      throw new Error('Conversation id is required for Bluesky DM voice signaling.');
+    }
+    this.convoId = convoId;
+    this.localDid = options.localDid?.trim() || undefined;
+    this.pollIntervalMs = Math.max(1_000, options.pollIntervalMs ?? BSKY_VOICE_SIGNAL_DEFAULT_POLL_MS);
+    this.sendDebounceMs = Math.max(150, options.sendDebounceMs ?? BSKY_VOICE_SIGNAL_DEFAULT_DEBOUNCE_MS);
+    this.messageLimit = Math.max(10, Math.min(100, options.messageLimit ?? BSKY_VOICE_SIGNAL_DEFAULT_LIMIT));
+    this.processExistingMessages = options.processExistingMessages ?? false;
+    this.ignoreSignalsBefore = options.ignoreSignalsBefore ?? 0;
+    this.onError = options.onError;
+    for (const messageId of options.seenMessageIds ?? []) {
+      this.rememberSeenMessage(messageId);
+    }
+    window.setTimeout(() => {
+      void this.pollOnce();
+    }, 0);
+    this.pollTimer = window.setInterval(() => {
+      void this.pollOnce();
+    }, this.pollIntervalMs);
+  }
+
+  send(message: GaiaP2PVoiceSignalMessage): Promise<void> {
+    if (this.closed) {
+      return Promise.reject(new Error('Bluesky DM voice signaling is closed.'));
+    }
+    return new Promise((resolve, reject) => {
+      this.outboundQueue.push({ message, resolve, reject });
+      if (shouldFlushBskyVoiceSignalImmediately(message)) {
+        this.clearFlushTimer();
+        void this.flushOutboundSignals();
+        return;
+      }
+      this.scheduleFlush();
+    });
+  }
+
+  subscribe(listener: P2PVoiceSignalListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (this.pollTimer) {
+      window.clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+    this.clearFlushTimer();
+    const error = new Error('Bluesky DM voice signaling is closed.');
+    for (const item of this.outboundQueue.splice(0)) {
+      item.reject(error);
+    }
+    this.listeners.clear();
+    this.seenMessageIds.clear();
+    this.seenMessageOrder.length = 0;
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer || this.closed) {
+      return;
+    }
+    this.flushTimer = window.setTimeout(() => {
+      this.flushTimer = undefined;
+      void this.flushOutboundSignals();
+    }, this.sendDebounceMs);
+  }
+
+  private clearFlushTimer(): void {
+    if (!this.flushTimer) {
+      return;
+    }
+    window.clearTimeout(this.flushTimer);
+    this.flushTimer = undefined;
+  }
+
+  private async flushOutboundSignals(): Promise<void> {
+    if (this.closed || this.outboundQueue.length === 0) {
+      return;
+    }
+    const batch = this.outboundQueue.splice(0);
+    try {
+      const text = encodeBskyVoiceSignalPayload(batch.map((item) => item.message));
+      await window.gaia.sendBskyMessage({ convoId: this.convoId, text });
+      for (const item of batch) {
+        item.resolve();
+      }
+    } catch (error) {
+      const normalized = normalizeP2PVoiceError(error, 'Could not send Bluesky DM voice signal.');
+      for (const item of batch) {
+        item.reject(normalized);
+      }
+      this.reportError(normalized);
+    }
+  }
+
+  private async pollOnce(): Promise<void> {
+    if (this.closed || this.pollInFlight) {
+      return;
+    }
+    this.pollInFlight = true;
+    const firstPoll = !this.initialized;
+    try {
+      const page = await window.gaia.listBskyMessages({
+        convoId: this.convoId,
+        limit: this.messageLimit,
+      });
+      const orderedMessages = [...page.messages].sort((left, right) => {
+        return Date.parse(left.sentAt) - Date.parse(right.sentAt);
+      });
+      for (const message of orderedMessages) {
+        if (this.seenMessageIds.has(message.id)) {
+          continue;
+        }
+        this.rememberSeenMessage(message.id);
+        if (firstPoll && !this.processExistingMessages) {
+          continue;
+        }
+        this.processBskyMessage(message);
+      }
+      this.initialized = true;
+    } catch (error) {
+      this.reportError(normalizeP2PVoiceError(error, 'Could not poll Bluesky DM voice signals.'));
+    } finally {
+      this.pollInFlight = false;
+    }
+  }
+
+  private processBskyMessage(message: GaiaBskyMessage): void {
+    if (this.localDid && message.senderDid === this.localDid) {
+      return;
+    }
+    const decodedMessages = decodeBskyVoiceSignalPayload(message.text);
+    if (decodedMessages.length === 0) {
+      return;
+    }
+    const sentAt = Date.parse(message.sentAt);
+    for (const signal of decodedMessages) {
+      const createdAt = Date.parse(signal.createdAt);
+      const signalTime = Number.isFinite(createdAt)
+        ? createdAt
+        : Number.isFinite(sentAt)
+          ? sentAt
+          : 0;
+      if (this.ignoreSignalsBefore > 0 && signalTime < this.ignoreSignalsBefore) {
+        continue;
+      }
+      for (const listener of this.listeners) {
+        listener(signal, {
+          convoId: this.convoId,
+          messageId: message.id,
+          senderDid: message.senderDid,
+          sentAt: message.sentAt,
+        });
+      }
+    }
+  }
+
+  private rememberSeenMessage(messageId: string): void {
+    this.seenMessageIds.add(messageId);
+    this.seenMessageOrder.push(messageId);
+    while (this.seenMessageOrder.length > BSKY_VOICE_SIGNAL_SEEN_LIMIT) {
+      const expired = this.seenMessageOrder.shift();
+      if (expired) {
+        this.seenMessageIds.delete(expired);
+      }
+    }
+  }
+
+  private reportError(error: Error): void {
+    this.onError?.(error);
   }
 }
 
@@ -122,6 +361,52 @@ export function serializeP2PVoiceSignalMessage(message: GaiaP2PVoiceSignalMessag
 
 export function formatP2PVoiceSignalBundle(messages: GaiaP2PVoiceSignalMessage[]): string {
   return messages.map(serializeP2PVoiceSignalMessage).join('\n');
+}
+
+export function encodeBskyVoiceSignalPayload(messages: GaiaP2PVoiceSignalMessage[]): string {
+  const payload = {
+    app: BSKY_VOICE_SIGNAL_APP,
+    kind: BSKY_VOICE_SIGNAL_KIND,
+    version: 1,
+    messages,
+  };
+  return `${BSKY_VOICE_SIGNAL_TEXT_PREFIX}${BSKY_VOICE_SIGNAL_TOKEN_PREFIX}${base64UrlEncode(
+    JSON.stringify(payload),
+  )}`;
+}
+
+export function decodeBskyVoiceSignalPayload(text: string): GaiaP2PVoiceSignalMessage[] {
+  const markerIndex = text.indexOf(BSKY_VOICE_SIGNAL_TOKEN_PREFIX);
+  if (markerIndex < 0) {
+    return [];
+  }
+  const encoded = text
+    .slice(markerIndex + BSKY_VOICE_SIGNAL_TOKEN_PREFIX.length)
+    .trim()
+    .split(/\s+/)[0];
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) {
+    return [];
+  }
+
+  try {
+    const decoded = base64UrlDecode(encoded);
+    const payload = JSON.parse(decoded) as unknown;
+    if (!payload || typeof payload !== 'object') {
+      return [];
+    }
+    const record = payload as Record<string, unknown>;
+    if (
+      record.app !== BSKY_VOICE_SIGNAL_APP ||
+      record.kind !== BSKY_VOICE_SIGNAL_KIND ||
+      record.version !== 1 ||
+      !Array.isArray(record.messages)
+    ) {
+      return [];
+    }
+    return parseP2PVoiceSignalText(JSON.stringify(record.messages)).messages;
+  } catch {
+    return [];
+  }
 }
 
 export function parseP2PVoiceSignalText(input: string): {
@@ -367,7 +652,7 @@ export class P2PVoiceCallService {
     }
 
     if (this.peerConnection?.signalingState === 'have-local-offer') {
-      throw new Error('Both peers created offers. Leave voice, then have only one peer join first.');
+      throw new Error('Both sides started a call at the same time. Hang up, then have one person start the call.');
     }
 
     this.updateState({
@@ -622,7 +907,10 @@ export class P2PVoiceCallService {
       createdAt: new Date().toISOString(),
       ...message,
     } as GaiaP2PVoiceSignalMessage;
-    this.signaling.send(envelope);
+    void Promise.resolve(this.signaling.send(envelope)).catch((error) => {
+      const status = normalizeP2PVoiceError(error, 'Could not send P2P voice signal.').message;
+      this.updateState({ status, error: status });
+    });
   }
 
   private updateState(patch: Partial<P2PVoiceState>): void {
@@ -662,6 +950,36 @@ function createVoiceId(prefix: string): string {
     return `${prefix}_${crypto.randomUUID()}`;
   }
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
+function shouldFlushBskyVoiceSignalImmediately(message: GaiaP2PVoiceSignalMessage): boolean {
+  return message.type === 'call-rejected' || message.type === 'call-ended' || message.type === 'leave-call';
+}
+
+function normalizeP2PVoiceError(error: unknown, fallback: string): Error {
+  return error instanceof Error ? error : new Error(fallback);
+}
+
+function base64UrlEncode(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '');
+}
+
+function base64UrlDecode(value: string): string {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function serializeIceCandidate(candidate: RTCIceCandidate): GaiaP2PVoiceIceCandidate {

@@ -3842,8 +3842,86 @@ button {
     var(--current-app-bg, var(--gaia-current-bg));
 }
 
-.message-thread.chat-pane.direct-call-open {
+.message-thread.chat-pane.direct-call-open,
+.message-thread.chat-pane.incoming-call-open {
   grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.message-thread.chat-pane.direct-call-open.incoming-call-open {
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.incoming-call-panel {
+  position: relative;
+  z-index: 4;
+  margin: 0 24px 10px;
+  border: 1px solid rgba(110, 255, 191, 0.24);
+  border-radius: 8px;
+  padding: 14px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  color: var(--ink);
+  background:
+    linear-gradient(180deg, rgba(20, 35, 34, 0.92), rgba(10, 16, 22, 0.9));
+  box-shadow:
+    0 18px 42px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.incoming-call-panel.hidden {
+  display: none;
+}
+
+.incoming-call-avatar {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.incoming-call-avatar .avatar {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+}
+
+.incoming-call-copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.incoming-call-copy span {
+  color: #a8ffd4;
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.incoming-call-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Sora, Manrope, Inter, ui-sans-serif, system-ui, sans-serif;
+  font-size: 1rem;
+}
+
+.incoming-call-copy p {
+  margin: 0;
+  color: rgba(235, 247, 255, 0.72);
+  font-size: 0.78rem;
+}
+
+.incoming-call-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .direct-call-panel {
@@ -6416,6 +6494,15 @@ button {
 
   .notification-detail-grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .incoming-call-panel {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .incoming-call-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
   }
 
   .toolbar-button:not(.icon-button) {
