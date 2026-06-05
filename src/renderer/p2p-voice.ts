@@ -25,6 +25,7 @@ const BSKY_VOICE_SIGNAL_MAX_TEXT_GRAPHEMES = 950;
 const BSKY_VOICE_SIGNAL_MAX_CHUNKS = 200;
 const BSKY_VOICE_SIGNAL_CHUNK_TTL_MS = 5 * 60_000;
 const BSKY_VOICE_SIGNAL_CHUNK_GROUP_LIMIT = 80;
+const BSKY_VOICE_SIGNAL_CLEANUP_LIMIT = 600;
 
 export type P2PVoicePhase =
   | 'idle'
@@ -112,6 +113,7 @@ export interface BskyDmP2PVoiceSignalingTransportOptions {
   processExistingMessages?: boolean;
   ignoreSignalsBefore?: number;
   seenMessageIds?: string[];
+  cleanupSignalMessages?: boolean;
   onError?: (error: Error) => void;
 }
 
@@ -145,10 +147,13 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
   private readonly messageLimit: number;
   private readonly processExistingMessages: boolean;
   private readonly ignoreSignalsBefore: number;
+  private readonly cleanupSignalMessages: boolean;
   private readonly onError?: (error: Error) => void;
   private readonly listeners = new Set<P2PVoiceSignalListener>();
   private readonly seenMessageIds = new Set<string>();
   private readonly seenMessageOrder: string[] = [];
+  private readonly cleanupMessageIds = new Set<string>();
+  private readonly cleanupMessageOrder: string[] = [];
   private readonly incomingChunkGroups = new Map<string, IncomingBskyVoiceSignalChunkGroup>();
   private outboundQueue: PendingBskyVoiceSignal[] = [];
   private pollTimer: number | undefined;
@@ -169,6 +174,7 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
     this.messageLimit = Math.max(10, Math.min(100, options.messageLimit ?? BSKY_VOICE_SIGNAL_DEFAULT_LIMIT));
     this.processExistingMessages = options.processExistingMessages ?? false;
     this.ignoreSignalsBefore = options.ignoreSignalsBefore ?? 0;
+    this.cleanupSignalMessages = options.cleanupSignalMessages ?? true;
     this.onError = options.onError;
     for (const messageId of options.seenMessageIds ?? []) {
       this.rememberSeenMessage(messageId);
@@ -220,6 +226,8 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
     this.listeners.clear();
     this.seenMessageIds.clear();
     this.seenMessageOrder.length = 0;
+    this.cleanupMessageIds.clear();
+    this.cleanupMessageOrder.length = 0;
     this.incomingChunkGroups.clear();
   }
 
@@ -249,7 +257,8 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
     for (const item of batch) {
       try {
         for (const text of encodeBskyVoiceSignalPayloadSegments([item.message])) {
-          await window.gaia.sendBskyMessage({ convoId: this.convoId, text });
+          const sentMessage = await window.gaia.sendBskyMessage({ convoId: this.convoId, text });
+          this.deleteSignalMessageForSelf(sentMessage.id);
         }
         item.resolve();
       } catch (error) {
@@ -279,6 +288,9 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
           continue;
         }
         this.rememberSeenMessage(message.id);
+        if (isBskyVoiceSignalPayloadText(message.text)) {
+          this.deleteSignalMessageForSelf(message.id);
+        }
         if (firstPoll && !this.processExistingMessages) {
           continue;
         }
@@ -293,6 +305,9 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
   }
 
   private processBskyMessage(message: GaiaBskyMessage): void {
+    if (isBskyVoiceSignalPayloadText(message.text)) {
+      this.deleteSignalMessageForSelf(message.id);
+    }
     if (this.localDid && message.senderDid === this.localDid) {
       return;
     }
@@ -331,6 +346,26 @@ export class BskyDmP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
         this.seenMessageIds.delete(expired);
       }
     }
+  }
+
+  private deleteSignalMessageForSelf(messageId: string): void {
+    if (!this.cleanupSignalMessages || this.closed || this.cleanupMessageIds.has(messageId)) {
+      return;
+    }
+    this.cleanupMessageIds.add(messageId);
+    this.cleanupMessageOrder.push(messageId);
+    while (this.cleanupMessageOrder.length > BSKY_VOICE_SIGNAL_CLEANUP_LIMIT) {
+      const expired = this.cleanupMessageOrder.shift();
+      if (expired) {
+        this.cleanupMessageIds.delete(expired);
+      }
+    }
+    void window.gaia
+      .deleteBskyMessageForSelf({
+        convoId: this.convoId,
+        messageId,
+      })
+      .catch(() => undefined);
   }
 
   private decodeBskyVoiceSignalPayload(message: GaiaBskyMessage): GaiaP2PVoiceSignalMessage[] {

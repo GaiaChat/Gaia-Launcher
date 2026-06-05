@@ -6109,6 +6109,9 @@ type BskyMessageDesktopNotification = {
 };
 
 function bskyMessagePreview(text: string | undefined): string {
+  if (text && isBskyVoiceSignalPayloadText(text)) {
+    return 'Voice call activity.';
+  }
   const preview = text?.replace(/\s+/g, ' ').trim();
   if (!preview) {
     return 'Sent a message.';
@@ -6119,6 +6122,9 @@ function bskyMessagePreview(text: string | undefined): string {
 function createBskyMessageDesktopNotification(convo: GaiaBskyConvo): BskyMessageDesktopNotification | null {
   const lastMessage = convo.lastMessage;
   if (!lastMessage) {
+    return null;
+  }
+  if (isBskyVoiceSignalPayloadText(lastMessage.text)) {
     return null;
   }
 
@@ -6179,6 +6185,10 @@ function shouldPlayBskyMessageNotification(
   for (const convo of nextConvos) {
     const lastMessage = convo.lastMessage;
     if (!lastMessage || lastMessage.senderDid === ownDid || (convo.unreadCount ?? 0) <= 0) {
+      continue;
+    }
+    if (isBskyVoiceSignalPayloadText(lastMessage.text)) {
+      rememberBskyNotificationMessageId(lastMessage.id);
       continue;
     }
 
@@ -8691,7 +8701,7 @@ function renderMessagesViewport(): void {
 }
 
 function bskyMessagePreviewText(message: GaiaBskyMessage): string {
-  return isBskyVoiceSignalPayloadText(message.text) ? 'Gaia voice call signal' : message.text;
+  return isBskyVoiceSignalPayloadText(message.text) ? 'Voice call activity' : message.text;
 }
 
 function renderConvos(): void {
