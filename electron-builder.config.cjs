@@ -4,6 +4,9 @@ const releasePageUrl =
   (updateBaseUrl
     ? updateBaseUrl.replace(/\/latest\/download\/?$/u, '/latest').replace(/\/download\/?$/u, '')
     : 'https://github.com/GaiaChat/Gaia-Launcher/releases/latest');
+const appIcon = 'src/assets/appicon/gaia_app_icon.png';
+const linuxIconSet = 'src/assets/appicon/linux';
+const windowsIcon = 'src/assets/appicon/win/icon.ico';
 
 /** @type {import('electron-builder').Configuration} */
 module.exports = {
@@ -14,6 +17,7 @@ module.exports = {
   directories: {
     output: 'release-app',
   },
+  icon: appIcon,
   files: ['dist/**/*', 'package.json'],
   extraMetadata: {
     main: 'dist/main/main.js',
@@ -57,7 +61,7 @@ module.exports = {
       },
     ],
     category: 'Network',
-    icon: 'src/assets/appicon/linux',
+    icon: linuxIconSet,
     artifactName: 'GaiaLauncher-${version}-${arch}.${ext}',
     desktop: {
       entry: {
@@ -68,6 +72,7 @@ module.exports = {
     },
   },
   mac: {
+    icon: appIcon,
     target: [
       {
         target: 'dmg',
@@ -82,6 +87,7 @@ module.exports = {
     artifactName: 'GaiaLauncher-${version}-mac-${arch}.${ext}',
   },
   win: {
+    icon: windowsIcon,
     target: [
       {
         target: 'nsis',
@@ -101,6 +107,8 @@ module.exports = {
     oneClick: false,
     perMachine: false,
     allowToChangeInstallationDirectory: true,
+    installerIcon: windowsIcon,
+    uninstallerIcon: windowsIcon,
     shortcutName: 'Gaia Launcher',
   },
   deb: {

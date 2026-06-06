@@ -3842,13 +3842,21 @@ button {
     var(--current-app-bg, var(--gaia-current-bg));
 }
 
-.message-thread.chat-pane.direct-call-open,
+.message-thread.chat-pane.direct-call-open {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .message-thread.chat-pane.incoming-call-open {
   grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .message-thread.chat-pane.direct-call-open.incoming-call-open {
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.message-thread.chat-pane.direct-call-open .messages-list,
+.message-thread.chat-pane.direct-call-open .message-composer {
+  display: none;
 }
 
 .incoming-call-panel {
@@ -3927,17 +3935,18 @@ button {
 .direct-call-panel {
   position: relative;
   z-index: 4;
-  margin: 0 24px 10px;
-  border: 1px solid rgba(235, 247, 255, 0.18);
+  min-height: 0;
+  margin: 0 24px 18px;
+  border: 1px solid rgba(235, 247, 255, 0.16);
   border-radius: 8px;
-  padding: 18px;
+  padding: 30px;
   display: grid;
-  gap: 14px;
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
+  gap: 18px;
   color: var(--ink);
   background:
-    radial-gradient(420px 180px at 18% 0%, rgba(110, 255, 191, 0.13), transparent 68%),
-    radial-gradient(360px 160px at 84% 16%, rgba(48, 180, 255, 0.12), transparent 72%),
-    linear-gradient(180deg, rgba(12, 18, 28, 0.92), rgba(8, 12, 20, 0.88));
+    linear-gradient(145deg, rgba(110, 255, 191, 0.1), rgba(48, 180, 255, 0.08) 34%, transparent 68%),
+    linear-gradient(180deg, rgba(12, 18, 28, 0.94), rgba(8, 12, 20, 0.9));
   box-shadow:
     0 22px 54px rgba(0, 0, 0, 0.34),
     inset 0 1px 0 rgba(255, 255, 255, 0.12);
@@ -3950,15 +3959,17 @@ button {
 
 .direct-call-close {
   position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 26px;
-  height: 26px;
+  top: 16px;
+  right: 16px;
+  width: 34px;
+  height: 34px;
   border: 0;
   border-radius: 999px;
   color: rgba(235, 247, 255, 0.78);
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.1);
   cursor: pointer;
+  font-size: 1.15rem;
+  line-height: 1;
 }
 
 .direct-call-close:hover,
@@ -3970,34 +3981,42 @@ button {
 
 .direct-call-hero {
   min-width: 0;
+  min-height: 0;
   display: flex;
+  flex-direction: column;
+  justify-content: center;
   align-items: center;
-  gap: 14px;
-  padding-right: 28px;
+  gap: 22px;
+  padding: 18px 42px 8px;
+  text-align: center;
 }
 
 .direct-call-avatar {
-  width: 70px;
-  height: 70px;
+  width: 156px;
+  height: 156px;
   border-radius: 50%;
   display: grid;
   place-items: center;
-  background: rgba(255, 255, 255, 0.08);
-  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.28);
+  background: linear-gradient(180deg, rgba(235, 247, 255, 0.14), rgba(235, 247, 255, 0.05));
+  box-shadow:
+    0 26px 60px rgba(0, 0, 0, 0.32),
+    0 0 0 10px rgba(110, 255, 191, 0.08),
+    0 0 0 1px rgba(235, 247, 255, 0.12);
   overflow: hidden;
   flex: 0 0 auto;
 }
 
 .direct-call-avatar .avatar {
-  width: 70px;
-  height: 70px;
+  width: 156px;
+  height: 156px;
   border-radius: 50%;
 }
 
 .direct-call-copy {
   min-width: 0;
+  justify-items: center;
   display: grid;
-  gap: 4px;
+  gap: 9px;
 }
 
 .direct-call-copy span {
@@ -4019,20 +4038,28 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: Sora, Manrope, Inter, ui-sans-serif, system-ui, sans-serif;
-  font-size: 1.35rem;
+  font-size: 2.25rem;
+  line-height: 1.08;
 }
 
 .direct-call-copy p,
 .direct-call-error {
   margin: 0;
   color: rgba(235, 247, 255, 0.76);
-  font-size: 0.84rem;
+  font-size: 0.94rem;
+  line-height: 1.55;
+}
+
+.direct-call-copy p {
+  max-width: 560px;
 }
 
 .direct-call-error {
+  justify-self: center;
+  max-width: 680px;
   border: 1px solid rgba(255, 122, 168, 0.28);
   border-radius: 8px;
-  padding: 9px 10px;
+  padding: 10px 12px;
   color: #ffd1df;
   background: rgba(255, 122, 168, 0.1);
 }
@@ -4044,6 +4071,7 @@ button {
 .direct-call-stats {
   display: flex;
   align-items: center;
+  justify-content: center;
   flex-wrap: wrap;
   gap: 8px;
 }
@@ -4051,7 +4079,7 @@ button {
 .direct-call-stats span {
   border: 1px solid rgba(235, 247, 255, 0.12);
   border-radius: 999px;
-  padding: 5px 9px;
+  padding: 7px 11px;
   color: rgba(235, 247, 255, 0.68);
   background: rgba(255, 255, 255, 0.06);
   font-size: 0.72rem;
@@ -4065,14 +4093,15 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 12px;
 }
 
 .direct-call-control {
-  min-width: 76px;
+  min-width: 94px;
+  min-height: 48px;
   border: 0;
   border-radius: 999px;
-  padding: 11px 14px;
+  padding: 12px 18px;
   color: #fff;
   background: rgba(255, 255, 255, 0.12);
   cursor: pointer;
@@ -4105,6 +4134,9 @@ button {
 }
 
 .direct-call-signaling {
+  align-self: end;
+  max-height: 31vh;
+  overflow: auto;
   border: 1px solid rgba(235, 247, 255, 0.12);
   border-radius: 8px;
   padding: 10px 12px;
@@ -4155,8 +4187,11 @@ button {
 }
 
 .direct-call-panel audio {
-  width: 100%;
-  height: 34px;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .messages-list {
@@ -6503,6 +6538,40 @@ button {
   .incoming-call-actions {
     grid-column: 1 / -1;
     justify-content: flex-end;
+  }
+
+  .direct-call-panel {
+    margin: 0 14px 14px;
+    padding: 22px;
+    gap: 14px;
+  }
+
+  .direct-call-close {
+    top: 12px;
+    right: 12px;
+  }
+
+  .direct-call-hero {
+    gap: 18px;
+    padding: 18px 28px 4px;
+  }
+
+  .direct-call-avatar,
+  .direct-call-avatar .avatar {
+    width: 128px;
+    height: 128px;
+  }
+
+  .direct-call-copy strong {
+    font-size: 1.7rem;
+  }
+
+  .direct-call-actions {
+    flex-wrap: wrap;
+  }
+
+  .direct-call-signal-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .toolbar-button:not(.icon-button) {
