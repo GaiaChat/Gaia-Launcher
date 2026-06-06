@@ -3933,24 +3933,48 @@ button {
 }
 
 .direct-call-panel {
+  --call-ink: #eef8ff;
+  --call-muted: rgba(235, 247, 255, 0.74);
+  --call-soft: rgba(235, 247, 255, 0.58);
+  --call-line: rgba(235, 247, 255, 0.16);
+  --call-chip-bg: rgba(255, 255, 255, 0.07);
+  --call-surface: rgba(255, 255, 255, 0.06);
+  --call-video-bg: #050a11;
+  --call-panel-bg:
+    linear-gradient(145deg, rgba(110, 255, 191, 0.1), rgba(48, 180, 255, 0.08) 34%, transparent 68%),
+    linear-gradient(180deg, rgba(12, 18, 28, 0.94), rgba(8, 12, 20, 0.9));
   position: relative;
   z-index: 4;
   min-height: 0;
   margin: 0 24px 18px;
-  border: 1px solid rgba(235, 247, 255, 0.16);
+  border: 1px solid var(--call-line);
   border-radius: 8px;
   padding: 30px;
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto auto auto;
   gap: 18px;
-  color: var(--ink);
-  background:
-    linear-gradient(145deg, rgba(110, 255, 191, 0.1), rgba(48, 180, 255, 0.08) 34%, transparent 68%),
-    linear-gradient(180deg, rgba(12, 18, 28, 0.94), rgba(8, 12, 20, 0.9));
+  color: var(--call-ink);
+  background: var(--call-panel-bg);
   box-shadow:
     0 22px 54px rgba(0, 0, 0, 0.34),
     inset 0 1px 0 rgba(255, 255, 255, 0.12);
   overflow: hidden;
+}
+
+.shell[data-resolved-appearance="light"] .direct-call-panel {
+  --call-ink: #123244;
+  --call-muted: rgba(20, 50, 68, 0.78);
+  --call-soft: rgba(20, 50, 68, 0.58);
+  --call-line: rgba(35, 104, 118, 0.2);
+  --call-chip-bg: rgba(255, 255, 255, 0.74);
+  --call-surface: rgba(255, 255, 255, 0.7);
+  --call-video-bg: #f1fbff;
+  --call-panel-bg:
+    linear-gradient(145deg, rgba(110, 255, 191, 0.2), rgba(48, 180, 255, 0.16) 38%, transparent 72%),
+    linear-gradient(180deg, rgba(237, 251, 255, 0.94), rgba(221, 243, 247, 0.9));
+  box-shadow:
+    0 22px 54px rgba(37, 92, 103, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.82);
 }
 
 .direct-call-panel.hidden {
@@ -3965,8 +3989,8 @@ button {
   height: 34px;
   border: 0;
   border-radius: 999px;
-  color: rgba(235, 247, 255, 0.78);
-  background: rgba(255, 255, 255, 0.1);
+  color: var(--call-muted);
+  background: var(--call-chip-bg);
   cursor: pointer;
   font-size: 1.15rem;
   line-height: 1;
@@ -3975,8 +3999,8 @@ button {
 .direct-call-close:hover,
 .direct-call-close:focus-visible {
   outline: none;
-  color: #fff;
-  background: rgba(255, 255, 255, 0.16);
+  color: var(--call-ink);
+  background: var(--call-surface);
 }
 
 .direct-call-hero {
@@ -3997,7 +4021,7 @@ button {
   border-radius: 50%;
   display: grid;
   place-items: center;
-  background: linear-gradient(180deg, rgba(235, 247, 255, 0.14), rgba(235, 247, 255, 0.05));
+  background: linear-gradient(180deg, var(--call-surface), rgba(255, 255, 255, 0.04));
   box-shadow:
     0 26px 60px rgba(0, 0, 0, 0.32),
     0 0 0 10px rgba(110, 255, 191, 0.08),
@@ -4032,7 +4056,14 @@ button {
   text-transform: uppercase;
 }
 
+.shell[data-resolved-appearance="light"] .direct-call-copy span {
+  border-color: rgba(20, 142, 103, 0.26);
+  color: #0f7559;
+  background: rgba(20, 142, 103, 0.1);
+}
+
 .direct-call-copy strong {
+  color: var(--call-ink);
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4045,7 +4076,7 @@ button {
 .direct-call-copy p,
 .direct-call-error {
   margin: 0;
-  color: rgba(235, 247, 255, 0.76);
+  color: var(--call-muted);
   font-size: 0.94rem;
   line-height: 1.55;
 }
@@ -4064,6 +4095,11 @@ button {
   background: rgba(255, 122, 168, 0.1);
 }
 
+.shell[data-resolved-appearance="light"] .direct-call-error {
+  color: #9d2848;
+  background: rgba(255, 122, 168, 0.14);
+}
+
 .direct-call-error.hidden {
   display: none;
 }
@@ -4077,16 +4113,16 @@ button {
 }
 
 .direct-call-stats span {
-  border: 1px solid rgba(235, 247, 255, 0.12);
+  border: 1px solid var(--call-line);
   border-radius: 999px;
   padding: 7px 11px;
-  color: rgba(235, 247, 255, 0.68);
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--call-soft);
+  background: var(--call-chip-bg);
   font-size: 0.72rem;
 }
 
 .direct-call-stats strong {
-  color: var(--ink);
+  color: var(--call-ink);
 }
 
 .direct-call-actions {
@@ -4103,7 +4139,7 @@ button {
   border-radius: 999px;
   padding: 12px 18px;
   color: #fff;
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.16);
   cursor: pointer;
   font-size: 0.76rem;
   font-weight: 900;
@@ -4118,7 +4154,7 @@ button {
 
 .direct-call-control:disabled {
   cursor: not-allowed;
-  opacity: 0.42;
+  opacity: 0.5;
 }
 
 .direct-call-start {
@@ -4133,19 +4169,127 @@ button {
   background: linear-gradient(180deg, #f2b85c, #ba7424);
 }
 
+.direct-call-share.active {
+  background: linear-gradient(180deg, #30b4ff, #246cc9);
+}
+
+.direct-call-panel[data-screen-sharing="active"] {
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+}
+
+.direct-call-panel[data-screen-sharing="active"] .direct-call-hero {
+  flex-direction: row;
+  justify-content: center;
+  gap: 16px;
+  padding: 0 42px;
+}
+
+.direct-call-panel[data-screen-sharing="active"] .direct-call-avatar,
+.direct-call-panel[data-screen-sharing="active"] .direct-call-avatar .avatar {
+  width: 78px;
+  height: 78px;
+}
+
+.direct-call-panel[data-screen-sharing="active"] .direct-call-copy {
+  justify-items: start;
+  text-align: left;
+}
+
+.direct-call-panel[data-screen-sharing="active"] .direct-call-copy strong {
+  font-size: 1.35rem;
+}
+
+.direct-call-screen-stage {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+
+.direct-call-screen-stage.hidden {
+  display: none;
+}
+
+.direct-call-screen-card {
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--call-line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--call-surface);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 14px 32px rgba(0, 0, 0, 0.16);
+}
+
+.direct-call-screen-card.hidden {
+  display: none;
+}
+
+.direct-call-screen-video {
+  position: relative;
+  min-height: 0;
+  aspect-ratio: 16 / 9;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--call-video-bg);
+}
+
+.direct-call-screen-video video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: var(--call-video-bg);
+}
+
+.direct-call-screen-video span {
+  color: var(--call-soft);
+  font-size: 0.84rem;
+}
+
+.direct-call-screen-video span.hidden {
+  display: none;
+}
+
+.direct-call-screen-card footer {
+  min-height: 44px;
+  padding: 8px 10px;
+  display: grid;
+  gap: 2px;
+}
+
+.direct-call-screen-card strong,
+.direct-call-screen-card small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.direct-call-screen-card strong {
+  color: var(--call-ink);
+  font-size: 0.88rem;
+}
+
+.direct-call-screen-card small {
+  color: var(--call-soft);
+  font-size: 0.76rem;
+}
+
 .direct-call-signaling {
   align-self: end;
   max-height: 31vh;
   overflow: auto;
-  border: 1px solid rgba(235, 247, 255, 0.12);
+  border: 1px solid var(--call-line);
   border-radius: 8px;
   padding: 10px 12px;
-  background: rgba(255, 255, 255, 0.055);
+  background: var(--call-surface);
 }
 
 .direct-call-signaling summary {
   cursor: pointer;
-  color: rgba(235, 247, 255, 0.78);
+  color: var(--call-muted);
   font-size: 0.78rem;
   font-weight: 800;
 }
@@ -4161,7 +4305,7 @@ button {
   min-width: 0;
   display: grid;
   gap: 6px;
-  color: rgba(235, 247, 255, 0.68);
+  color: var(--call-soft);
   font-size: 0.72rem;
   font-weight: 800;
 }
@@ -4170,13 +4314,17 @@ button {
   width: 100%;
   min-height: 74px;
   resize: vertical;
-  border: 1px solid rgba(235, 247, 255, 0.14);
+  border: 1px solid var(--call-line);
   border-radius: 8px;
   padding: 8px;
-  color: var(--ink);
-  background: rgba(3, 7, 12, 0.34);
+  color: var(--call-ink);
+  background: rgba(3, 7, 12, 0.2);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 0.72rem;
+}
+
+.shell[data-resolved-appearance="light"] .direct-call-signal-grid textarea {
+  background: rgba(255, 255, 255, 0.74);
 }
 
 .direct-call-signal-actions {
@@ -6564,6 +6712,27 @@ button {
 
   .direct-call-copy strong {
     font-size: 1.7rem;
+  }
+
+  .direct-call-panel[data-screen-sharing="active"] .direct-call-hero {
+    flex-direction: column;
+    padding: 0 28px;
+    text-align: center;
+  }
+
+  .direct-call-panel[data-screen-sharing="active"] .direct-call-copy {
+    justify-items: center;
+    text-align: center;
+  }
+
+  .direct-call-panel[data-screen-sharing="active"] .direct-call-avatar,
+  .direct-call-panel[data-screen-sharing="active"] .direct-call-avatar .avatar {
+    width: 68px;
+    height: 68px;
+  }
+
+  .direct-call-screen-stage {
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .direct-call-actions {

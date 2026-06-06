@@ -13,7 +13,7 @@ import {
 } from '../shared';
 
 export const P2P_VOICE_DIRECT_FAILURE_MESSAGE =
-  'Direct P2P connection failed. This network may require a TURN relay.';
+  'Call could not connect. Try again, or add relay settings if this keeps happening.';
 const BSKY_VOICE_SIGNAL_TEXT_PREFIX = 'Gaia voice call signal: ';
 const BSKY_VOICE_SIGNAL_TOKEN_PREFIX = 'gaia-call:v1:';
 const BSKY_VOICE_SIGNAL_CHUNK_TOKEN_PREFIX = 'gaia-call:v1c:';
@@ -49,6 +49,8 @@ export interface P2PVoiceState {
   muted: boolean;
   localStreamActive: boolean;
   remoteStreamActive: boolean;
+  localScreenShareActive: boolean;
+  remoteScreenShareActive: boolean;
   usingTurn: boolean;
   signalingMode: P2PVoiceSignalingMode;
   connectionState?: RTCPeerConnectionState;
@@ -59,6 +61,7 @@ export interface P2PVoiceState {
 export type P2PVoiceSignalingMode = 'manual' | 'bsky-dm' | 'atproto-record';
 export type P2PVoiceStateListener = (state: P2PVoiceState) => void;
 export type P2PVoiceRemoteStreamListener = (stream: MediaStream | null) => void;
+export type P2PVoiceLocalScreenStreamListener = (stream: MediaStream | null) => void;
 export interface P2PVoiceSignalSource {
   convoId?: string;
   messageId?: string;
@@ -739,7 +742,7 @@ export function parseP2PVoiceSignalText(input: string): {
         if (message) {
           messages.push(message);
         } else {
-          errors.push('Signal payload is not a supported Gaia P2P voice message.');
+          errors.push('This call setup text is not supported.');
         }
       }
     } catch {
@@ -754,9 +757,13 @@ export class P2PVoiceCallService {
   private readonly signaling: P2PVoiceSignalingTransport;
   private readonly stateListeners = new Set<P2PVoiceStateListener>();
   private readonly remoteStreamListeners = new Set<P2PVoiceRemoteStreamListener>();
+  private readonly localScreenStreamListeners = new Set<P2PVoiceLocalScreenStreamListener>();
   private readonly signalingUnsubscribe: () => void;
   private iceConfig: GaiaP2PVoiceIceConfig;
   private localStream: MediaStream | null = null;
+  private localScreenShareStream: MediaStream | null = null;
+  private localScreenShareSender: RTCRtpSender | null = null;
+  private localScreenTrackEndedListener: (() => void) | null = null;
   private remoteStream: MediaStream | null = null;
   private peerConnection: RTCPeerConnection | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
@@ -777,12 +784,14 @@ export class P2PVoiceCallService {
     };
     this.state = {
       phase: 'idle',
-      status: 'Ready for a direct P2P voice call.',
+      status: 'Ready for a call.',
       localPeerId: createVoiceId('peer'),
       roomId: options.roomId ?? 'manual-p2p-voice',
       muted: false,
       localStreamActive: false,
       remoteStreamActive: false,
+      localScreenShareActive: false,
+      remoteScreenShareActive: false,
       usingTurn: hasConfiguredTurnServers(this.iceConfig),
       signalingMode: this.signaling.mode,
     };
@@ -824,6 +833,14 @@ export class P2PVoiceCallService {
     };
   }
 
+  onLocalScreenStream(listener: P2PVoiceLocalScreenStreamListener): () => void {
+    this.localScreenStreamListeners.add(listener);
+    listener(this.localScreenShareStream);
+    return () => {
+      this.localScreenStreamListeners.delete(listener);
+    };
+  }
+
   async joinVoice(): Promise<void> {
     this.assertUsable();
     if (this.peerConnection || this.localStream) {
@@ -833,7 +850,7 @@ export class P2PVoiceCallService {
     const callId = createVoiceId('call');
     this.updateState({
       phase: 'requesting-media',
-      status: 'Requesting microphone access.',
+      status: 'Asking to use your microphone.',
       callId,
       error: undefined,
       muted: false,
@@ -844,7 +861,7 @@ export class P2PVoiceCallService {
       const peerConnection = this.createPeerConnection();
       this.sendControlSignal('join-call');
 
-      this.updateState({ phase: 'creating-offer', status: 'Creating a WebRTC offer.' });
+      this.updateState({ phase: 'creating-offer', status: 'Starting the call.' });
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
       this.sendSignal({
@@ -855,9 +872,9 @@ export class P2PVoiceCallService {
         },
       });
       this.startConnectionTimer();
-      this.updateState({ phase: 'waiting-for-answer', status: 'Waiting for peer answer.' });
+      this.updateState({ phase: 'waiting-for-answer', status: 'Waiting for them to answer.' });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not start P2P voice.';
+      const message = error instanceof Error ? error.message : 'Could not start the call.';
       this.fail(message);
       throw error;
     }
@@ -879,7 +896,7 @@ export class P2PVoiceCallService {
 
     try {
       if (message.type === 'join-call') {
-        this.updateState({ status: 'Peer joined the manual signaling room.' });
+        this.updateState({ status: 'Call room ready.' });
         return;
       }
       if (message.type === 'leave-call' || message.type === 'call-ended' || message.type === 'call-rejected') {
@@ -921,6 +938,67 @@ export class P2PVoiceCallService {
     });
   }
 
+  async startScreenShare(): Promise<void> {
+    this.assertUsable();
+    if (this.localScreenShareStream) {
+      return;
+    }
+    if (!this.peerConnection || this.state.phase !== 'connected') {
+      throw new Error('Start the call before sharing your screen.');
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      throw new Error('Screen sharing is not available here.');
+    }
+
+    this.updateState({ status: 'Choose what to share.', error: undefined });
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        audio: false,
+        video: {
+          width: { ideal: 1280, max: 1920 },
+          height: { ideal: 720, max: 1080 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+      });
+      const track = stream.getVideoTracks()[0];
+      if (!track) {
+        throw new Error('No screen was selected.');
+      }
+
+      this.localScreenShareStream = stream;
+      this.localScreenTrackEndedListener = () => {
+        void this.stopScreenShare().catch((error) => {
+          this.updateState({
+            status: normalizeP2PVoiceError(error, 'Could not stop screen sharing.').message,
+          });
+        });
+      };
+      track.addEventListener('ended', this.localScreenTrackEndedListener, { once: true });
+      this.localScreenShareSender = this.peerConnection.addTrack(track, stream);
+      this.emitLocalScreenStream();
+      this.updateState({
+        localScreenShareActive: true,
+        status: 'Sharing your screen.',
+      });
+      await this.renegotiateCall('Sharing your screen.');
+    } catch (error) {
+      if (stream) {
+        for (const track of stream.getTracks()) {
+          track.stop();
+        }
+      }
+      await this.stopScreenShareInternal({ renegotiate: false });
+      const message = error instanceof Error ? error.message : 'Could not share your screen.';
+      this.updateState({ status: message, error: message });
+      throw error;
+    }
+  }
+
+  async stopScreenShare(): Promise<void> {
+    await this.stopScreenShareInternal({ renegotiate: true });
+  }
+
   leaveVoice(): void {
     if (this.state.callId && this.state.phase !== 'idle') {
       this.sendControlSignal('leave-call', 'Left voice.');
@@ -932,6 +1010,8 @@ export class P2PVoiceCallService {
       callId: undefined,
       error: undefined,
       muted: false,
+      localScreenShareActive: false,
+      remoteScreenShareActive: false,
     });
   }
 
@@ -948,6 +1028,7 @@ export class P2PVoiceCallService {
     this.signaling.close();
     this.stateListeners.clear();
     this.remoteStreamListeners.clear();
+    this.localScreenStreamListeners.clear();
   }
 
   private async acceptOffer(description: { type: 'offer' | 'answer'; sdp: string }): Promise<void> {
@@ -961,10 +1042,12 @@ export class P2PVoiceCallService {
 
     this.updateState({
       phase: 'requesting-media',
-      status: 'Incoming offer received. Requesting microphone access.',
+      status: this.localStream ? 'Updating the call.' : 'Incoming call. Asking to use your microphone.',
       error: undefined,
     });
-    await this.ensureLocalStream();
+    if (!this.localStream) {
+      await this.ensureLocalStream();
+    }
     const peerConnection = this.peerConnection ?? this.createPeerConnection();
     await peerConnection.setRemoteDescription({ type: 'offer', sdp: description.sdp });
     await this.flushRemoteIceCandidates();
@@ -978,7 +1061,10 @@ export class P2PVoiceCallService {
       },
     });
     this.startConnectionTimer();
-    this.updateState({ phase: 'connecting', status: 'Answer sent. Connecting directly to peer.' });
+    this.updateState({
+      phase: this.state.phase === 'connected' ? 'connected' : 'connecting',
+      status: this.state.phase === 'connected' ? 'Call updated.' : 'Connecting.',
+    });
   }
 
   private async acceptAnswer(description: { type: 'offer' | 'answer'; sdp: string }): Promise<void> {
@@ -992,7 +1078,10 @@ export class P2PVoiceCallService {
     await this.flushRemoteIceCandidates();
     this.cleanupPublishedSignalsForCurrentCall();
     this.startConnectionTimer();
-    this.updateState({ phase: 'connecting', status: 'Answer received. Connecting directly to peer.' });
+    this.updateState({
+      phase: this.state.phase === 'connected' ? 'connected' : 'connecting',
+      status: this.state.phase === 'connected' ? 'Call updated.' : 'Connecting.',
+    });
   }
 
   private async ensureLocalStream(): Promise<MediaStream> {
@@ -1046,13 +1135,14 @@ export class P2PVoiceCallService {
         for (const track of streams[0].getTracks()) {
           if (!remoteStream.getTracks().some((existing) => existing.id === track.id)) {
             remoteStream.addTrack(track);
+            this.watchRemoteTrack(track);
           }
         }
       } else if (!remoteStream.getTracks().some((track) => track.id === event.track.id)) {
         remoteStream.addTrack(event.track);
+        this.watchRemoteTrack(event.track);
       }
-      this.updateState({ remoteStreamActive: remoteStream.getAudioTracks().length > 0 });
-      this.emitRemoteStream();
+      this.syncRemoteMediaState();
     };
     peerConnection.onconnectionstatechange = () => this.handleConnectionStateChange();
     peerConnection.oniceconnectionstatechange = () => this.handleConnectionStateChange();
@@ -1072,11 +1162,11 @@ export class P2PVoiceCallService {
     };
     if (!this.peerConnection || !this.peerConnection.remoteDescription) {
       this.pendingRemoteCandidates.push(candidateInit);
-      this.updateState({ status: 'Queued peer ICE candidate.' });
+      this.updateState({ status: 'Connecting.' });
       return;
     }
     await this.peerConnection.addIceCandidate(candidateInit);
-    this.updateState({ status: 'Peer ICE candidate added.' });
+    this.updateState({ status: 'Connecting.' });
   }
 
   private async flushRemoteIceCandidates(): Promise<void> {
@@ -1101,9 +1191,7 @@ export class P2PVoiceCallService {
       this.cleanupPublishedSignalsForCurrentCall();
       this.updateState({
         phase: 'connected',
-        status: this.state.usingTurn
-          ? 'Connected. Direct P2P is active with optional TURN config available.'
-          : 'Connected over direct P2P using STUN-only ICE.',
+        status: 'Connected.',
         connectionState,
         iceConnectionState,
         error: undefined,
@@ -1119,7 +1207,7 @@ export class P2PVoiceCallService {
     if (connectionState === 'disconnected' || iceConnectionState === 'disconnected') {
       this.updateState({
         phase: 'reconnecting',
-        status: 'Connection interrupted. Trying to reconnect directly.',
+        status: 'Connection interrupted. Reconnecting.',
         connectionState,
         iceConnectionState,
       });
@@ -1140,7 +1228,7 @@ export class P2PVoiceCallService {
     }
     this.cleanedCallSignalIds.add(callId);
     void Promise.resolve(this.signaling.cleanupCall?.(callId)).catch((error) => {
-      const status = normalizeP2PVoiceError(error, 'Could not clean up P2P voice signals.').message;
+      const status = normalizeP2PVoiceError(error, 'Could not clean up call setup.').message;
       this.updateState({ status });
     });
   }
@@ -1175,6 +1263,7 @@ export class P2PVoiceCallService {
   private cleanup(options: { stopLocalTracks: boolean }): void {
     this.clearConnectionTimer();
     this.pendingRemoteCandidates = [];
+    void this.stopScreenShareInternal({ renegotiate: false });
     if (this.peerConnection) {
       this.peerConnection.onicecandidate = null;
       this.peerConnection.ontrack = null;
@@ -1199,9 +1288,101 @@ export class P2PVoiceCallService {
     this.updateState({
       localStreamActive: Boolean(this.localStream),
       remoteStreamActive: false,
+      localScreenShareActive: false,
+      remoteScreenShareActive: false,
       connectionState: undefined,
       iceConnectionState: undefined,
     });
+  }
+
+  private async stopScreenShareInternal(options: { renegotiate: boolean }): Promise<void> {
+    const stream = this.localScreenShareStream;
+    const sender = this.localScreenShareSender;
+    const endedListener = this.localScreenTrackEndedListener;
+    if (!stream && !sender) {
+      return;
+    }
+
+    const track = stream?.getVideoTracks()[0];
+    if (track && endedListener) {
+      track.removeEventListener('ended', endedListener);
+    }
+    if (sender && this.peerConnection) {
+      try {
+        this.peerConnection.removeTrack(sender);
+      } catch {
+        // The sender may already be gone if the peer connection is closing.
+      }
+    }
+    if (stream) {
+      for (const streamTrack of stream.getTracks()) {
+        streamTrack.stop();
+      }
+    }
+
+    this.localScreenShareStream = null;
+    this.localScreenShareSender = null;
+    this.localScreenTrackEndedListener = null;
+    this.emitLocalScreenStream();
+    this.updateState({
+      localScreenShareActive: false,
+      status: 'Screen sharing stopped.',
+    });
+
+    if (
+      options.renegotiate &&
+      this.peerConnection &&
+      this.state.callId &&
+      this.state.phase === 'connected' &&
+      this.peerConnection.signalingState === 'stable'
+    ) {
+      await this.renegotiateCall('Screen sharing stopped.');
+    }
+  }
+
+  private async renegotiateCall(status: string): Promise<void> {
+    const peerConnection = this.peerConnection;
+    if (!peerConnection || !this.state.callId) {
+      return;
+    }
+    if (peerConnection.signalingState !== 'stable') {
+      throw new Error('The call is already updating. Try again in a moment.');
+    }
+
+    this.updateState({ status });
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+    this.sendSignal({
+      type: 'offer',
+      description: {
+        type: 'offer',
+        sdp: peerConnection.localDescription?.sdp ?? offer.sdp ?? '',
+      },
+    });
+  }
+
+  private watchRemoteTrack(track: MediaStreamTrack): void {
+    const update = () => {
+      this.syncRemoteMediaState();
+    };
+    track.addEventListener('mute', update);
+    track.addEventListener('unmute', update);
+    track.addEventListener('ended', update, { once: true });
+  }
+
+  private syncRemoteMediaState(): void {
+    const stream = this.remoteStream;
+    const remoteAudioActive = Boolean(
+      stream?.getAudioTracks().some((track) => track.readyState === 'live'),
+    );
+    const remoteScreenActive = Boolean(
+      stream?.getVideoTracks().some((track) => track.readyState === 'live' && !track.muted),
+    );
+    this.updateState({
+      remoteStreamActive: remoteAudioActive,
+      remoteScreenShareActive: remoteScreenActive,
+    });
+    this.emitRemoteStream();
   }
 
   private sendControlSignal(type: GaiaP2PVoiceControlSignal['type'], reason?: string): void {
@@ -1226,7 +1407,7 @@ export class P2PVoiceCallService {
       ...message,
     } as GaiaP2PVoiceSignalMessage;
     void Promise.resolve(this.signaling.send(envelope)).catch((error) => {
-      const status = normalizeP2PVoiceError(error, 'Could not send P2P voice signal.').message;
+      const status = normalizeP2PVoiceError(error, 'Could not update the call.').message;
       this.updateState({ status, error: status });
     });
   }
@@ -1250,9 +1431,15 @@ export class P2PVoiceCallService {
     }
   }
 
+  private emitLocalScreenStream(): void {
+    for (const listener of this.localScreenStreamListeners) {
+      listener(this.localScreenShareStream);
+    }
+  }
+
   private assertUsable(): void {
     if (this.destroyed) {
-      throw new Error('P2P voice service is closed.');
+      throw new Error('This call is closed.');
     }
   }
 }

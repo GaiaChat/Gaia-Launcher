@@ -248,6 +248,7 @@ type P2PVoiceActionInFlight =
   | 'join'
   | 'leave'
   | 'mute'
+  | 'screen-share'
   | 'apply-signal'
   | 'copy-signal'
   | 'accept'
@@ -702,7 +703,7 @@ root.innerHTML = `
                 <h1 id="threadTitle">Select a message</h1>
                 <span class="thread-subtitle" id="threadId"></span>
               </div>
-              <button class="thread-call-button" id="messageCallButton" type="button" title="Start P2P voice call" aria-label="Start P2P voice call" disabled>
+              <button class="thread-call-button" id="messageCallButton" type="button" title="Start call" aria-label="Start call" disabled>
                 <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                   <path
                     d="M6.45 5.25c.39-.39 1.04-.39 1.43 0l2.04 2.04c.35.35.4.9.12 1.31l-.98 1.45a.9.9 0 0 0 .1 1.14l3.65 3.65a.9.9 0 0 0 1.14.1l1.45-.98c.41-.28.96-.23 1.31.12l2.04 2.04c.39.39.39 1.04 0 1.43l-1.1 1.1c-.7.7-1.72.98-2.68.72-5.02-1.34-8.96-5.28-10.3-10.3-.26-.96.02-1.98.72-2.68l1.06-1.14Z"
@@ -715,12 +716,12 @@ root.innerHTML = `
                 </svg>
               </button>
             </header>
-            <section class="incoming-call-panel hidden" id="p2pIncomingCallPanel" aria-label="Incoming P2P voice call">
+            <section class="incoming-call-panel hidden" id="p2pIncomingCallPanel" aria-label="Incoming Gaia call">
               <div class="incoming-call-avatar" id="p2pIncomingCallAvatar"></div>
               <div class="incoming-call-copy">
                 <span>Incoming call</span>
                 <strong id="p2pIncomingCallTitle">Direct call</strong>
-                <p id="p2pIncomingCallSubtitle">Bluesky DM signaling, WebRTC audio.</p>
+                <p id="p2pIncomingCallSubtitle">Gaia call.</p>
               </div>
               <div class="incoming-call-actions">
                 <button class="direct-call-control direct-call-start" id="p2pAcceptCallButton" type="button">
@@ -731,25 +732,51 @@ root.innerHTML = `
                 </button>
               </div>
             </section>
-            <section class="direct-call-panel hidden" id="p2pCallPanel" aria-label="Direct P2P voice call">
+            <section class="direct-call-panel hidden" id="p2pCallPanel" aria-label="Gaia call">
               <button class="direct-call-close" id="p2pCallCloseButton" type="button" aria-label="Close call panel">×</button>
               <div class="direct-call-hero">
                 <div class="direct-call-avatar" id="p2pCallAvatar"></div>
                 <div class="direct-call-copy">
-                  <span id="p2pVoiceMode">STUN-only</span>
+                  <span id="p2pVoiceMode">Gaia call</span>
                   <strong id="p2pCallTitle">Direct call</strong>
-                  <p id="p2pVoiceStatus">Ready for a direct P2P voice call.</p>
+                  <p id="p2pVoiceStatus">Ready for a call.</p>
                 </div>
               </div>
               <p class="direct-call-error hidden" id="p2pVoiceError"></p>
+              <div class="direct-call-screen-stage hidden" id="p2pScreenShareStage" aria-label="Screen sharing">
+                <article class="direct-call-screen-card hidden" id="p2pRemoteScreenCard">
+                  <div class="direct-call-screen-video">
+                    <video id="p2pRemoteScreenVideo" autoplay playsinline muted></video>
+                    <span id="p2pRemoteScreenPlaceholder">Waiting for screen</span>
+                  </div>
+                  <footer>
+                    <strong id="p2pRemoteScreenTitle">Screen share</strong>
+                    <small>Viewing their screen</small>
+                  </footer>
+                </article>
+                <article class="direct-call-screen-card local hidden" id="p2pLocalScreenCard">
+                  <div class="direct-call-screen-video">
+                    <video id="p2pLocalScreenVideo" autoplay playsinline muted></video>
+                    <span id="p2pLocalScreenPlaceholder">Choose a screen to share</span>
+                  </div>
+                  <footer>
+                    <strong>Your screen</strong>
+                    <small>Sharing with this call</small>
+                  </footer>
+                </article>
+              </div>
               <div class="direct-call-stats">
                 <span>Local mic <strong id="p2pLocalMicState">Off</strong></span>
-                <span>Remote audio <strong id="p2pRemoteAudioState">Waiting</strong></span>
-                <span id="p2pVoiceTransportLabel">Direct P2P / STUN-only</span>
+                <span>Their audio <strong id="p2pRemoteAudioState">Waiting</strong></span>
+                <span>Screen <strong id="p2pScreenShareState">Off</strong></span>
+                <span>Call path <strong id="p2pVoiceTransportLabel">Direct</strong></span>
               </div>
               <div class="direct-call-actions">
                 <button class="direct-call-control direct-call-mic" id="p2pMuteVoiceButton" type="button" disabled>
                   <span>Mute</span>
+                </button>
+                <button class="direct-call-control direct-call-share" id="p2pScreenShareButton" type="button" disabled>
+                  <span>Share Screen</span>
                 </button>
                 <button class="direct-call-control direct-call-start" id="p2pJoinVoiceButton" type="button">
                   <span>Start Call</span>
@@ -1004,11 +1031,21 @@ const p2pCallTitle = document.querySelector<HTMLElement>('#p2pCallTitle')!;
 const p2pVoiceMode = document.querySelector<HTMLSpanElement>('#p2pVoiceMode')!;
 const p2pVoiceStatus = document.querySelector<HTMLElement>('#p2pVoiceStatus')!;
 const p2pVoiceError = document.querySelector<HTMLParagraphElement>('#p2pVoiceError')!;
+const p2pScreenShareStage = document.querySelector<HTMLDivElement>('#p2pScreenShareStage')!;
+const p2pRemoteScreenCard = document.querySelector<HTMLElement>('#p2pRemoteScreenCard')!;
+const p2pLocalScreenCard = document.querySelector<HTMLElement>('#p2pLocalScreenCard')!;
+const p2pRemoteScreenVideo = document.querySelector<HTMLVideoElement>('#p2pRemoteScreenVideo')!;
+const p2pLocalScreenVideo = document.querySelector<HTMLVideoElement>('#p2pLocalScreenVideo')!;
+const p2pRemoteScreenPlaceholder = document.querySelector<HTMLElement>('#p2pRemoteScreenPlaceholder')!;
+const p2pLocalScreenPlaceholder = document.querySelector<HTMLElement>('#p2pLocalScreenPlaceholder')!;
+const p2pRemoteScreenTitle = document.querySelector<HTMLElement>('#p2pRemoteScreenTitle')!;
 const p2pJoinVoiceButton = document.querySelector<HTMLButtonElement>('#p2pJoinVoiceButton')!;
 const p2pMuteVoiceButton = document.querySelector<HTMLButtonElement>('#p2pMuteVoiceButton')!;
+const p2pScreenShareButton = document.querySelector<HTMLButtonElement>('#p2pScreenShareButton')!;
 const p2pLeaveVoiceButton = document.querySelector<HTMLButtonElement>('#p2pLeaveVoiceButton')!;
 const p2pLocalMicState = document.querySelector<HTMLElement>('#p2pLocalMicState')!;
 const p2pRemoteAudioState = document.querySelector<HTMLElement>('#p2pRemoteAudioState')!;
+const p2pScreenShareState = document.querySelector<HTMLElement>('#p2pScreenShareState')!;
 const p2pLocalSignalOutput = document.querySelector<HTMLTextAreaElement>('#p2pLocalSignalOutput')!;
 const p2pPeerSignalInput = document.querySelector<HTMLTextAreaElement>('#p2pPeerSignalInput')!;
 const p2pManualSignalingDetails = document.querySelector<HTMLDetailsElement>('#p2pManualSignalingDetails')!;
@@ -1141,6 +1178,7 @@ let p2pVoiceOutboundSignals: GaiaP2PVoiceSignalMessage[] = [];
 let p2pVoiceActionInFlight: P2PVoiceActionInFlight = null;
 let p2pVoiceStateUnsubscribe: (() => void) | null = null;
 let p2pVoiceRemoteStreamUnsubscribe: (() => void) | null = null;
+let p2pVoiceLocalScreenStreamUnsubscribe: (() => void) | null = null;
 let p2pDirectCallOpen = false;
 let p2pDirectCallConvoId: string | null = null;
 let p2pBskyMonitorEntries = new Map<string, P2PVoiceMonitorEntry>();
@@ -4214,9 +4252,52 @@ async function copySpotifyRedirectUri(): Promise<void> {
   }
 }
 
+function mediaStreamFromTracks(tracks: MediaStreamTrack[]): MediaStream | null {
+  return tracks.length > 0 ? new MediaStream(tracks) : null;
+}
+
+function setMediaElementStream(
+  element: HTMLMediaElement,
+  stream: MediaStream | null,
+  options: { play?: boolean } = {},
+): void {
+  if (element.srcObject !== stream) {
+    element.srcObject = stream;
+  }
+  if (!stream) {
+    element.pause();
+    return;
+  }
+  if (options.play !== false) {
+    void element.play().catch(() => undefined);
+  }
+}
+
+function bindRemoteP2PVoiceStream(stream: MediaStream | null): void {
+  const audioStream = stream
+    ? mediaStreamFromTracks(stream.getAudioTracks().filter((track) => track.readyState === 'live'))
+    : null;
+  const screenStream = stream
+    ? mediaStreamFromTracks(stream.getVideoTracks().filter((track) => track.readyState === 'live'))
+    : null;
+  setMediaElementStream(p2pRemoteAudio, audioStream);
+  setMediaElementStream(p2pRemoteScreenVideo, screenStream);
+  if (p2pDirectCallOpen) {
+    renderP2PDirectCallPanel();
+  }
+}
+
+function bindLocalP2PScreenStream(stream: MediaStream | null): void {
+  setMediaElementStream(p2pLocalScreenVideo, stream);
+  if (p2pDirectCallOpen) {
+    renderP2PDirectCallPanel();
+  }
+}
+
 function bindP2PVoiceService(service: P2PVoiceCallService): void {
   p2pVoiceStateUnsubscribe?.();
   p2pVoiceRemoteStreamUnsubscribe?.();
+  p2pVoiceLocalScreenStreamUnsubscribe?.();
   p2pVoiceState = service.getState();
   p2pVoiceStateUnsubscribe = service.subscribe((state) => {
     p2pVoiceState = state;
@@ -4236,13 +4317,10 @@ function bindP2PVoiceService(service: P2PVoiceCallService): void {
     }
   });
   p2pVoiceRemoteStreamUnsubscribe = service.onRemoteStream((stream) => {
-    p2pRemoteAudio.srcObject = stream;
-    if (stream) {
-      void p2pRemoteAudio.play().catch(() => undefined);
-    }
-    if (p2pDirectCallOpen) {
-      renderP2PDirectCallPanel();
-    }
+    bindRemoteP2PVoiceStream(stream);
+  });
+  p2pVoiceLocalScreenStreamUnsubscribe = service.onLocalScreenStream((stream) => {
+    bindLocalP2PScreenStream(stream);
   });
 }
 
@@ -4252,10 +4330,14 @@ function replaceP2PVoiceService(
 ): void {
   p2pVoiceStateUnsubscribe?.();
   p2pVoiceRemoteStreamUnsubscribe?.();
+  p2pVoiceLocalScreenStreamUnsubscribe?.();
   p2pVoiceStateUnsubscribe = null;
   p2pVoiceRemoteStreamUnsubscribe = null;
+  p2pVoiceLocalScreenStreamUnsubscribe = null;
   p2pVoiceService.destroy();
-  p2pRemoteAudio.srcObject = null;
+  setMediaElementStream(p2pRemoteAudio, null);
+  setMediaElementStream(p2pRemoteScreenVideo, null);
+  setMediaElementStream(p2pLocalScreenVideo, null);
   p2pVoiceSignaling = signaling;
   p2pVoiceSignalingConvoId = signalingConvoId;
   if (signaling.mode !== 'manual') {
@@ -4586,7 +4668,7 @@ function renderIncomingP2PVoicePrompt(): void {
   const title = convoTitle(convo);
   p2pIncomingCallAvatar.replaceChildren(buildAvatar(convoPrimaryActor(convo), title, 'md'));
   p2pIncomingCallTitle.textContent = title;
-  p2pIncomingCallSubtitle.textContent = 'Incoming Gaia voice call.';
+  p2pIncomingCallSubtitle.textContent = 'Incoming Gaia call.';
   p2pAcceptCallButton.disabled = busy || !p2pVoiceCanJoin();
   p2pRejectCallButton.disabled = busy;
   p2pAcceptCallButton.querySelector('span')!.textContent =
@@ -4619,9 +4701,9 @@ async function acceptIncomingP2PVoiceCall(): Promise<void> {
     incomingP2PVoiceOffer = null;
     renderMessagesViewport();
     await p2pVoiceService.receiveSignal(incoming.message);
-    setStatus('P2P voice answer sent', 'good');
+    setStatus('Call accepted', 'good');
   } catch (error) {
-    setStatus(error instanceof Error ? error.message : 'Could not accept P2P voice call.', 'bad');
+    setStatus(error instanceof Error ? error.message : 'Could not accept the call.', 'bad');
   } finally {
     p2pVoiceActionInFlight = null;
     resetIdleBskyDmP2PVoiceService();
@@ -4644,7 +4726,7 @@ async function rejectIncomingP2PVoiceCall(): Promise<void> {
     }
     setStatus('Call rejected', 'warn');
   } catch (error) {
-    setStatus(error instanceof Error ? error.message : 'Could not reject P2P voice call.', 'bad');
+    setStatus(error instanceof Error ? error.message : 'Could not reject the call.', 'bad');
   } finally {
     p2pVoiceActionInFlight = null;
     renderMessagesViewport();
@@ -4709,28 +4791,16 @@ function p2pVoiceCanLeave(state = p2pVoiceState): boolean {
 
 function p2pVoiceModeLabel(state = p2pVoiceState): string {
   if (state.signalingMode === 'atproto-record') {
-    return state.usingTurn ? 'Gaia native + TURN optional' : 'Gaia native call';
+    return 'Gaia call';
   }
   if (state.signalingMode === 'bsky-dm') {
-    return state.usingTurn ? 'Bluesky DM + TURN optional' : 'Bluesky DM signaling';
+    return 'Gaia call';
   }
-  return state.usingTurn ? 'Direct P2P + optional TURN' : 'STUN-only';
+  return 'Manual call';
 }
 
 function p2pVoiceTransportLabelText(state = p2pVoiceState): string {
-  if (state.signalingMode === 'atproto-record') {
-    return state.usingTurn
-      ? 'WebRTC P2P media, native call setup, optional TURN config available'
-      : 'WebRTC P2P media, native call setup, STUN-only ICE';
-  }
-  if (state.signalingMode === 'bsky-dm') {
-    return state.usingTurn
-      ? 'WebRTC P2P media, Bluesky DM signaling, optional TURN config available'
-      : 'WebRTC P2P media, Bluesky DM signaling, STUN-only ICE';
-  }
-  return state.usingTurn
-    ? 'Direct P2P first, with optional community TURN config available'
-    : 'Direct P2P / STUN-only';
+  return state.usingTurn ? 'Direct or relay' : 'Direct';
 }
 
 function syncP2PVoiceSignalOutput(): void {
@@ -4761,7 +4831,7 @@ function renderP2PDirectCallPanel(): void {
   messageCallButton.title = incomingForCurrentConvo
     ? 'Accept or reject the incoming call'
     : canCall
-      ? 'Start P2P voice call'
+      ? 'Start call'
       : 'Calls need an accepted 1:1 Bluesky DM';
   p2pCallPanel.classList.toggle('hidden', !p2pDirectCallOpen);
   messageThread.classList.toggle('direct-call-open', p2pDirectCallOpen);
@@ -4778,21 +4848,47 @@ function renderP2PDirectCallPanel(): void {
   p2pCallPanel.dataset.phase = p2pVoiceState.phase;
   p2pCallPanel.dataset.muted = p2pVoiceState.muted ? 'true' : 'false';
   p2pCallPanel.dataset.remoteAudio = p2pVoiceState.remoteStreamActive ? 'active' : 'waiting';
+  p2pCallPanel.dataset.screenSharing =
+    p2pVoiceState.localScreenShareActive || p2pVoiceState.remoteScreenShareActive ? 'active' : 'idle';
   p2pVoiceMode.textContent = p2pVoiceModeLabel();
   p2pVoiceStatus.textContent = p2pVoiceState.status;
   p2pVoiceError.textContent = error ?? '';
   p2pVoiceError.classList.toggle('hidden', !error);
   p2pVoiceTransportLabel.textContent = p2pVoiceTransportLabelText();
 
+  const screenSharingVisible = p2pVoiceState.localScreenShareActive || p2pVoiceState.remoteScreenShareActive;
+  p2pScreenShareStage.classList.toggle('hidden', !screenSharingVisible);
+  p2pRemoteScreenCard.classList.toggle('hidden', !p2pVoiceState.remoteScreenShareActive);
+  p2pLocalScreenCard.classList.toggle('hidden', !p2pVoiceState.localScreenShareActive);
+  p2pRemoteScreenPlaceholder.classList.toggle('hidden', p2pVoiceState.remoteScreenShareActive);
+  p2pLocalScreenPlaceholder.classList.toggle('hidden', p2pVoiceState.localScreenShareActive);
+  p2pRemoteScreenTitle.textContent = `${selectedP2PCallTitle()}'s screen`;
+
   p2pJoinVoiceButton.disabled = busy || incomingForCurrentConvo || !p2pVoiceCanJoin();
   p2pJoinVoiceButton.querySelector('span')!.textContent =
-    p2pVoiceActionInFlight === 'join' ? 'Calling...' : 'Start Call';
+    p2pVoiceActionInFlight === 'join'
+      ? 'Calling...'
+      : p2pVoiceCanJoin()
+        ? 'Start Call'
+        : 'In Call';
   p2pLeaveVoiceButton.disabled = busy || !p2pVoiceCanLeave();
   p2pLeaveVoiceButton.querySelector('span')!.textContent =
     p2pVoiceActionInFlight === 'leave' ? 'Ending...' : 'End';
   p2pMuteVoiceButton.disabled = busy || !p2pVoiceState.localStreamActive;
   p2pMuteVoiceButton.classList.toggle('muted', p2pVoiceState.muted);
   p2pMuteVoiceButton.querySelector('span')!.textContent = p2pVoiceState.muted ? 'Unmute' : 'Mute';
+  const screenShareBusy = p2pVoiceActionInFlight === 'screen-share';
+  const canToggleScreenShare =
+    p2pVoiceState.localScreenShareActive || p2pVoiceState.phase === 'connected';
+  p2pScreenShareButton.disabled = (busy && !screenShareBusy) || !canToggleScreenShare;
+  p2pScreenShareButton.classList.toggle('active', p2pVoiceState.localScreenShareActive);
+  p2pScreenShareButton.querySelector('span')!.textContent = screenShareBusy
+    ? p2pVoiceState.localScreenShareActive
+      ? 'Stopping...'
+      : 'Sharing...'
+    : p2pVoiceState.localScreenShareActive
+      ? 'Stop Share'
+      : 'Share Screen';
 
   p2pLocalMicState.textContent = p2pVoiceState.localStreamActive
     ? p2pVoiceState.muted
@@ -4800,10 +4896,15 @@ function renderP2PDirectCallPanel(): void {
       : 'On'
     : 'Off';
   p2pRemoteAudioState.textContent = p2pVoiceState.remoteStreamActive
-    ? 'Receiving'
+    ? 'On'
     : p2pVoiceState.phase === 'connected'
-      ? 'No remote track'
+      ? 'Waiting'
       : 'Waiting';
+  p2pScreenShareState.textContent = p2pVoiceState.localScreenShareActive
+    ? 'Sharing'
+    : p2pVoiceState.remoteScreenShareActive
+      ? 'Viewing'
+      : 'Off';
   p2pCopySignalButton.disabled = busy || p2pVoiceOutboundSignals.length === 0;
   p2pClearSignalButton.disabled = busy || p2pVoiceOutboundSignals.length === 0;
   p2pApplySignalButton.disabled = busy || p2pPeerSignalInput.value.trim().length === 0;
@@ -4888,16 +4989,16 @@ function appendP2PVoiceTurnSettings(card: HTMLElement, draft: GaiaSettings): voi
   const turn = draft.p2pVoice.turnServers[0] ?? {};
   appendSettingsRow(
     card,
-    'TURN URL',
-    'Optional community relay URL. Leave blank for STUN-only P2P.',
+    'Relay URL',
+    'Optional backup relay for networks that block direct calls.',
     createSettingsTextInput('TURN URL', turn.turnUrl ?? '', 'turn:relay.example.org:3478', (turnUrl) =>
       updateP2PVoiceTurnDraft({ turnUrl }),
     'url'),
   );
   appendSettingsRow(
     card,
-    'TURNS URL',
-    'Optional TLS relay URL for networks that require it.',
+    'Secure relay URL',
+    'Optional secure relay for stricter networks.',
     createSettingsTextInput('TURNS URL', turn.turnsUrl ?? '', 'turns:relay.example.org:5349', (turnsUrl) =>
       updateP2PVoiceTurnDraft({ turnsUrl }),
     'url'),
@@ -4906,7 +5007,7 @@ function appendP2PVoiceTurnSettings(card: HTMLElement, draft: GaiaSettings): voi
     card,
     'Username',
     'Optional relay username. Gaia ships with none.',
-    createSettingsTextInput('TURN username', turn.username ?? '', 'community-user', (username) =>
+    createSettingsTextInput('Relay username', turn.username ?? '', 'community-user', (username) =>
       updateP2PVoiceTurnDraft({ username }),
     ),
   );
@@ -4914,7 +5015,7 @@ function appendP2PVoiceTurnSettings(card: HTMLElement, draft: GaiaSettings): voi
     card,
     'Credential',
     'Optional relay credential. Do not paste paid service secrets here.',
-    createSettingsTextInput('TURN credential', turn.credential ?? '', 'community credential', (credential) =>
+    createSettingsTextInput('Relay credential', turn.credential ?? '', 'community credential', (credential) =>
       updateP2PVoiceTurnDraft({ credential }),
     'password'),
   );
@@ -4940,9 +5041,9 @@ async function joinP2PVoice(): Promise<void> {
   renderP2PDirectCallPanel();
   try {
     await p2pVoiceService.joinVoice();
-    setStatus('P2P voice offer ready', 'neutral');
+    setStatus('Calling...', 'neutral');
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Could not start P2P voice.';
+    const message = error instanceof Error ? error.message : 'Could not start the call.';
     setStatus(message, 'bad');
   } finally {
     p2pVoiceActionInFlight = null;
@@ -4956,6 +5057,29 @@ async function toggleP2PVoiceMute(): Promise<void> {
   renderP2PDirectCallPanel();
   try {
     await p2pVoiceService.setMuted(!p2pVoiceState.muted);
+  } finally {
+    p2pVoiceActionInFlight = null;
+    renderP2PDirectCallPanel();
+  }
+}
+
+async function toggleP2PScreenShare(): Promise<void> {
+  if (!p2pDirectCallOpen || p2pVoiceState.phase !== 'connected') {
+    setStatus('Start the call before sharing your screen.', 'warn');
+    return;
+  }
+  p2pVoiceActionInFlight = 'screen-share';
+  renderP2PDirectCallPanel();
+  try {
+    if (p2pVoiceState.localScreenShareActive) {
+      await p2pVoiceService.stopScreenShare();
+      setStatus('Screen sharing stopped', 'neutral');
+    } else {
+      await p2pVoiceService.startScreenShare();
+      setStatus('Sharing your screen', 'good');
+    }
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : 'Could not update screen sharing.', 'bad');
   } finally {
     p2pVoiceActionInFlight = null;
     renderP2PDirectCallPanel();
@@ -4979,7 +5103,7 @@ async function copyP2PVoiceSignal(): Promise<void> {
   renderP2PDirectCallPanel();
   try {
     await navigator.clipboard.writeText(signal);
-    setStatus('P2P voice signal copied', 'good');
+    setStatus('Call setup copied', 'good');
   } catch {
     p2pLocalSignalOutput.focus();
     p2pLocalSignalOutput.select();
@@ -5082,7 +5206,7 @@ function renderConnectionsSettings(draft: GaiaSettings): DocumentFragment {
     ),
   );
 
-  const p2pCard = createSettingsCard('Experimental P2P Voice', 'Direct microphone calls for 1-on-1 or tiny rooms.');
+  const p2pCard = createSettingsCard('Gaia Calls', 'One-on-one calls with voice and screen sharing.');
   appendSettingsRow(
     p2pCard,
     'Call setup',
@@ -5090,7 +5214,7 @@ function renderConnectionsSettings(draft: GaiaSettings): DocumentFragment {
       ? 'Native setup keeps call data out of message text.'
       : 'Compatibility setup uses Bluesky messages for older clients.',
     createSegmentedControl<GaiaP2PVoiceSettings['signaling']>(
-      'P2P call setup',
+      'Call setup',
       [
         { value: 'atproto-record', label: 'Native' },
         { value: 'bsky-dm', label: 'Compatibility' },
@@ -5106,7 +5230,7 @@ function renderConnectionsSettings(draft: GaiaSettings): DocumentFragment {
       ? 'Incoming Gaia calls are ignored on this device.'
       : 'Only accepted 1-on-1 conversations can ring this device.',
     createSegmentedControl<GaiaP2PVoiceSettings['incomingCalls']>(
-      'Incoming P2P calls',
+      'Incoming calls',
       [
         { value: 'accepted-conversations', label: 'Accepted' },
         { value: 'none', label: 'Off' },
@@ -5133,11 +5257,11 @@ function renderConnectionsSettings(draft: GaiaSettings): DocumentFragment {
   );
   appendSettingsRow(
     p2pCard,
-    'ICE mode',
+    'Connection fallback',
     draft.p2pVoice.turnServers.length > 0
-      ? 'STUN plus optional community TURN configuration.'
-      : 'STUN-only. No relay credentials are configured.',
-    createUpdatePill(draft.p2pVoice.turnServers.length > 0 ? 'TURN optional' : 'STUN-only'),
+      ? 'A backup relay is configured for harder networks.'
+      : 'Direct calls only. No relay is configured.',
+    createUpdatePill(draft.p2pVoice.turnServers.length > 0 ? 'Relay ready' : 'Direct only'),
   );
   appendP2PVoiceTurnSettings(p2pCard, draft);
 
@@ -10228,6 +10352,9 @@ p2pJoinVoiceButton.addEventListener('click', () => {
 });
 p2pMuteVoiceButton.addEventListener('click', () => {
   void toggleP2PVoiceMute();
+});
+p2pScreenShareButton.addEventListener('click', () => {
+  void toggleP2PScreenShare();
 });
 p2pLeaveVoiceButton.addEventListener('click', () => {
   closeP2PDirectCall({ leave: true });
