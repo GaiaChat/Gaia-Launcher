@@ -1,5 +1,7 @@
 import {
   GAIA_P2P_VOICE_DEFAULT_STUN_URLS,
+  coerceGaiaP2PVoiceSignalMessage,
+  type GaiaBskyCallSignal,
   type GaiaBskyMessage,
   type GaiaP2PVoiceControlSignal,
   type GaiaP2PVoiceIceCandidate,
@@ -54,12 +56,13 @@ export interface P2PVoiceState {
   error?: string;
 }
 
-export type P2PVoiceSignalingMode = 'manual' | 'bsky-dm';
+export type P2PVoiceSignalingMode = 'manual' | 'bsky-dm' | 'atproto-record';
 export type P2PVoiceStateListener = (state: P2PVoiceState) => void;
 export type P2PVoiceRemoteStreamListener = (stream: MediaStream | null) => void;
 export interface P2PVoiceSignalSource {
   convoId?: string;
   messageId?: string;
+  recordKey?: string;
   senderDid?: string;
   sentAt?: string;
 }
@@ -72,6 +75,7 @@ export interface P2PVoiceSignalingTransport {
   readonly mode: P2PVoiceSignalingMode;
   send(message: GaiaP2PVoiceSignalMessage): void | Promise<void>;
   subscribe(listener: P2PVoiceSignalListener): () => void;
+  cleanupCall?(callId: string): void | Promise<void>;
   close(): void;
 }
 
@@ -101,6 +105,191 @@ export class ManualP2PVoiceSignalingTransport implements P2PVoiceSignalingTransp
 
   close(): void {
     this.listeners.clear();
+  }
+}
+
+export interface AtprotoRecordP2PVoiceSignalingTransportOptions {
+  convoId: string;
+  peerDid: string;
+  pollIntervalMs?: number;
+  messageLimit?: number;
+  processExistingSignals?: boolean;
+  ignoreSignalsBefore?: number;
+  seenRecordKeys?: string[];
+  onError?: (error: Error) => void;
+}
+
+export class AtprotoRecordP2PVoiceSignalingTransport implements P2PVoiceSignalingTransport {
+  readonly mode = 'atproto-record' as const;
+
+  private readonly convoId: string;
+  private readonly peerDid: string;
+  private readonly pollIntervalMs: number;
+  private readonly messageLimit: number;
+  private readonly processExistingSignals: boolean;
+  private readonly ignoreSignalsBefore: number;
+  private readonly onError?: (error: Error) => void;
+  private readonly listeners = new Set<P2PVoiceSignalListener>();
+  private readonly seenRecordKeys = new Set<string>();
+  private readonly seenRecordOrder: string[] = [];
+  private readonly publishedRecordKeysByCallId = new Map<string, Set<string>>();
+  private pollTimer: number | undefined;
+  private pollInFlight = false;
+  private initialized = false;
+  private closed = false;
+
+  constructor(options: AtprotoRecordP2PVoiceSignalingTransportOptions) {
+    const convoId = options.convoId.trim();
+    const peerDid = options.peerDid.trim();
+    if (!convoId || !peerDid) {
+      throw new Error('Conversation and peer DID are required for Gaia Call records.');
+    }
+    this.convoId = convoId;
+    this.peerDid = peerDid;
+    this.pollIntervalMs = Math.max(1_000, options.pollIntervalMs ?? BSKY_VOICE_SIGNAL_DEFAULT_POLL_MS);
+    this.messageLimit = Math.max(10, Math.min(100, options.messageLimit ?? BSKY_VOICE_SIGNAL_DEFAULT_LIMIT));
+    this.processExistingSignals = options.processExistingSignals ?? false;
+    this.ignoreSignalsBefore = options.ignoreSignalsBefore ?? 0;
+    this.onError = options.onError;
+    for (const recordKey of options.seenRecordKeys ?? []) {
+      this.rememberSeenRecord(recordKey);
+    }
+    void window.gaia.ensureBskyCallKey().catch((error) => {
+      this.reportError(normalizeP2PVoiceError(error, 'Could not prepare Gaia Call keys.'));
+    });
+    window.setTimeout(() => {
+      void this.pollOnce();
+    }, 0);
+    this.pollTimer = window.setInterval(() => {
+      void this.pollOnce();
+    }, this.pollIntervalMs);
+  }
+
+  async send(message: GaiaP2PVoiceSignalMessage): Promise<void> {
+    if (this.closed) {
+      throw new Error('Gaia Call record signaling is closed.');
+    }
+    try {
+      const response = await window.gaia.publishBskyCallSignal({
+        peerDid: this.peerDid,
+        convoId: this.convoId,
+        signal: message,
+      });
+      this.rememberPublishedRecord(message.callId, response.rkey);
+    } catch (error) {
+      const normalized = normalizeP2PVoiceError(error, 'Could not publish Gaia Call signal.');
+      this.reportError(normalized);
+      throw normalized;
+    }
+  }
+
+  subscribe(listener: P2PVoiceSignalListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  async cleanupCall(callId: string): Promise<void> {
+    const rkeys = Array.from(this.publishedRecordKeysByCallId.get(callId) ?? []);
+    if (rkeys.length === 0) {
+      return;
+    }
+    this.publishedRecordKeysByCallId.delete(callId);
+    try {
+      await window.gaia.deleteBskyCallSignals({ rkeys });
+    } catch (error) {
+      this.reportError(normalizeP2PVoiceError(error, 'Could not clean up Gaia Call records.'));
+    }
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (this.pollTimer) {
+      window.clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+    this.listeners.clear();
+    this.seenRecordKeys.clear();
+    this.seenRecordOrder.length = 0;
+    this.publishedRecordKeysByCallId.clear();
+  }
+
+  private async pollOnce(): Promise<void> {
+    if (this.closed || this.pollInFlight) {
+      return;
+    }
+    this.pollInFlight = true;
+    const firstPoll = !this.initialized;
+    try {
+      const page = await window.gaia.listBskyCallSignals({
+        peerDid: this.peerDid,
+        convoId: this.convoId,
+        limit: this.messageLimit,
+        ignoreBefore: this.ignoreSignalsBefore > 0 ? new Date(this.ignoreSignalsBefore).toISOString() : undefined,
+      });
+      for (const item of page.signals) {
+        this.processCallSignal(item, firstPoll);
+      }
+      this.initialized = true;
+    } catch (error) {
+      this.reportError(normalizeP2PVoiceError(error, 'Could not poll Gaia Call records.'));
+    } finally {
+      this.pollInFlight = false;
+    }
+  }
+
+  private processCallSignal(item: GaiaBskyCallSignal, firstPoll: boolean): void {
+    const recordKey = item.source.rkey;
+    if (!recordKey || this.seenRecordKeys.has(recordKey)) {
+      return;
+    }
+    this.rememberSeenRecord(recordKey);
+    if (firstPoll && !this.processExistingSignals) {
+      return;
+    }
+    const sentAt = Date.parse(item.source.createdAt);
+    const createdAt = Date.parse(item.signal.createdAt);
+    const signalTime = Number.isFinite(createdAt)
+      ? createdAt
+      : Number.isFinite(sentAt)
+        ? sentAt
+        : 0;
+    if (this.ignoreSignalsBefore > 0 && signalTime < this.ignoreSignalsBefore) {
+      return;
+    }
+    for (const listener of this.listeners) {
+      listener(item.signal, {
+        convoId: this.convoId,
+        recordKey,
+        senderDid: item.senderDid,
+        sentAt: item.source.createdAt,
+      });
+    }
+  }
+
+  private rememberPublishedRecord(callId: string, rkey: string): void {
+    const existing = this.publishedRecordKeysByCallId.get(callId) ?? new Set<string>();
+    existing.add(rkey);
+    this.publishedRecordKeysByCallId.set(callId, existing);
+  }
+
+  private rememberSeenRecord(recordKey: string): void {
+    this.seenRecordKeys.add(recordKey);
+    this.seenRecordOrder.push(recordKey);
+    while (this.seenRecordOrder.length > BSKY_VOICE_SIGNAL_SEEN_LIMIT) {
+      const expired = this.seenRecordOrder.shift();
+      if (expired) {
+        this.seenRecordKeys.delete(expired);
+      }
+    }
+  }
+
+  private reportError(error: Error): void {
+    this.onError?.(error);
   }
 }
 
@@ -546,7 +735,7 @@ export function parseP2PVoiceSignalText(input: string): {
       const parsed = JSON.parse(candidate) as unknown;
       const values = Array.isArray(parsed) ? parsed : [parsed];
       for (const value of values) {
-        const message = coerceP2PVoiceSignalMessage(value);
+        const message = coerceGaiaP2PVoiceSignalMessage(value);
         if (message) {
           messages.push(message);
         } else {
@@ -571,6 +760,7 @@ export class P2PVoiceCallService {
   private remoteStream: MediaStream | null = null;
   private peerConnection: RTCPeerConnection | null = null;
   private pendingRemoteCandidates: RTCIceCandidateInit[] = [];
+  private cleanedCallSignalIds = new Set<string>();
   private connectionTimer: number | undefined;
   private destroyed = false;
   private state: P2PVoiceState;
@@ -800,6 +990,7 @@ export class P2PVoiceCallService {
     }
     await this.peerConnection.setRemoteDescription({ type: 'answer', sdp: description.sdp });
     await this.flushRemoteIceCandidates();
+    this.cleanupPublishedSignalsForCurrentCall();
     this.startConnectionTimer();
     this.updateState({ phase: 'connecting', status: 'Answer received. Connecting directly to peer.' });
   }
@@ -907,6 +1098,7 @@ export class P2PVoiceCallService {
     const iceConnectionState = peerConnection.iceConnectionState;
     if (connectionState === 'connected' || iceConnectionState === 'connected' || iceConnectionState === 'completed') {
       this.clearConnectionTimer();
+      this.cleanupPublishedSignalsForCurrentCall();
       this.updateState({
         phase: 'connected',
         status: this.state.usingTurn
@@ -938,6 +1130,18 @@ export class P2PVoiceCallService {
     this.updateState({
       connectionState,
       iceConnectionState,
+    });
+  }
+
+  private cleanupPublishedSignalsForCurrentCall(): void {
+    const callId = this.state.callId;
+    if (!callId || this.cleanedCallSignalIds.has(callId)) {
+      return;
+    }
+    this.cleanedCallSignalIds.add(callId);
+    void Promise.resolve(this.signaling.cleanupCall?.(callId)).catch((error) => {
+      const status = normalizeP2PVoiceError(error, 'Could not clean up P2P voice signals.').message;
+      this.updateState({ status });
     });
   }
 

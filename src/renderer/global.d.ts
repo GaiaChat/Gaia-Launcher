@@ -3,15 +3,21 @@ import type {
   GaiaAuthResult,
   GaiaBskyActor,
   GaiaBskyActorSearchRequest,
+  GaiaBskyCallKey,
+  GaiaBskyCallSignalPage,
   GaiaBskyConvo,
   GaiaBskyConvoForMemberRequest,
   GaiaBskyConvoPage,
+  GaiaBskyDeleteCallSignalsRequest,
   GaiaBskyDeletedMessage,
+  GaiaBskyListCallSignalsRequest,
   GaiaBskyMessage,
   GaiaBskyMessageDeleteRequest,
   GaiaBskyMessagePage,
   GaiaBskyMessagesRequest,
   GaiaBskyPageRequest,
+  GaiaBskyPublishCallSignalRequest,
+  GaiaBskyPublishCallSignalResponse,
   GaiaBskyReadRequest,
   GaiaBskyReactionRequest,
   GaiaBskySendMessageRequest,
@@ -69,6 +75,10 @@ declare global {
       sendBskyMessage(request: GaiaBskySendMessageRequest): Promise<GaiaBskyMessage>;
       deleteBskyMessageForSelf(request: GaiaBskyMessageDeleteRequest): Promise<GaiaBskyDeletedMessage>;
       updateBskyRead(request: GaiaBskyReadRequest): Promise<GaiaBskyConvo>;
+      ensureBskyCallKey(): Promise<GaiaBskyCallKey>;
+      publishBskyCallSignal(request: GaiaBskyPublishCallSignalRequest): Promise<GaiaBskyPublishCallSignalResponse>;
+      listBskyCallSignals(request: GaiaBskyListCallSignalsRequest): Promise<GaiaBskyCallSignalPage>;
+      deleteBskyCallSignals(request: GaiaBskyDeleteCallSignalsRequest): Promise<{ deleted: number }>;
       searchCurrentGifs(request: GaiaGifSearchRequest): Promise<GaiaGifSearchResponse>;
       getNotifications(): Promise<GaiaNotificationCenterState>;
       markNotificationsRead(notificationIds?: string[]): Promise<GaiaNotificationCenterState>;

@@ -1,10 +1,14 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   GaiaAuthResult,
+  GaiaBskyDeleteCallSignalsRequest,
   GaiaBskyConvoForMemberRequest,
+  GaiaBskyListCallSignalsRequest,
   GaiaBskyMessagesRequest,
   GaiaBskyPageRequest,
   GaiaBskyActorSearchRequest,
+  GaiaBskyPublishCallSignalRequest,
+  GaiaBskyPublishCallSignalResponse,
   GaiaBskyMessageDeleteRequest,
   GaiaBskyReadRequest,
   GaiaBskyReactionRequest,
@@ -56,6 +60,13 @@ contextBridge.exposeInMainWorld('gaia', {
   deleteBskyMessageForSelf: (request: GaiaBskyMessageDeleteRequest) =>
     ipcRenderer.invoke('gaia:bsky:message:delete-for-self', request),
   updateBskyRead: (request: GaiaBskyReadRequest) => ipcRenderer.invoke('gaia:bsky:read:update', request),
+  ensureBskyCallKey: () => ipcRenderer.invoke('gaia:bsky:call:key:ensure'),
+  publishBskyCallSignal: (request: GaiaBskyPublishCallSignalRequest): Promise<GaiaBskyPublishCallSignalResponse> =>
+    ipcRenderer.invoke('gaia:bsky:call:signal:publish', request),
+  listBskyCallSignals: (request: GaiaBskyListCallSignalsRequest) =>
+    ipcRenderer.invoke('gaia:bsky:call:signals:list', request),
+  deleteBskyCallSignals: (request: GaiaBskyDeleteCallSignalsRequest): Promise<{ deleted: number }> =>
+    ipcRenderer.invoke('gaia:bsky:call:signals:delete', request),
   searchCurrentGifs: (request: GaiaGifSearchRequest) => ipcRenderer.invoke('gaia:current:gifs:search', request),
   getNotifications: (): Promise<GaiaNotificationCenterState> => ipcRenderer.invoke('gaia:notifications:get'),
   markNotificationsRead: (notificationIds?: string[]) =>

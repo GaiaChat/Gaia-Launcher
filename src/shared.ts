@@ -72,8 +72,15 @@ export interface GaiaP2PVoiceTurnServer {
   credential?: string;
 }
 
+export type GaiaP2PVoiceSignalingPreference = 'atproto-record' | 'bsky-dm';
+export type GaiaP2PVoiceIncomingCallPolicy = 'accepted-conversations' | 'none';
+
 export interface GaiaP2PVoiceSettings {
   turnServers: GaiaP2PVoiceTurnServer[];
+  signaling: GaiaP2PVoiceSignalingPreference;
+  incomingCalls: GaiaP2PVoiceIncomingCallPolicy;
+  incomingCallNotifications: boolean;
+  respectConversationMute: boolean;
 }
 
 export interface GaiaP2PVoiceIceConfig {
@@ -154,6 +161,90 @@ export type GaiaP2PVoiceSignalMessage =
   | GaiaP2PVoiceAnswerSignal
   | GaiaP2PVoiceIceCandidateSignal
   | GaiaP2PVoiceControlSignal;
+
+export function coerceGaiaP2PVoiceSignalMessage(value: unknown): GaiaP2PVoiceSignalMessage | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.type !== 'string' ||
+    typeof record.callId !== 'string' ||
+    typeof record.roomId !== 'string' ||
+    typeof record.senderId !== 'string' ||
+    typeof record.createdAt !== 'string'
+  ) {
+    return null;
+  }
+
+  const base = {
+    version: 1 as const,
+    type: record.type,
+    callId: record.callId,
+    roomId: record.roomId,
+    senderId: record.senderId,
+    createdAt: record.createdAt,
+  };
+
+  if (record.type === 'offer' || record.type === 'answer') {
+    const description = coerceGaiaP2PVoiceSessionDescription(record.description, record.type);
+    return description ? { ...base, type: record.type, description } : null;
+  }
+  if (record.type === 'ice-candidate') {
+    const candidate = coerceGaiaP2PVoiceIceCandidate(record.candidate);
+    return candidate ? { ...base, type: 'ice-candidate', candidate } : null;
+  }
+  if (
+    record.type === 'join-call' ||
+    record.type === 'leave-call' ||
+    record.type === 'call-rejected' ||
+    record.type === 'call-ended'
+  ) {
+    return {
+      ...base,
+      type: record.type,
+      reason: typeof record.reason === 'string' ? record.reason : undefined,
+    };
+  }
+
+  return null;
+}
+
+function coerceGaiaP2PVoiceSessionDescription(
+  value: unknown,
+  expectedType: 'offer' | 'answer',
+): GaiaP2PVoiceSessionDescription | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  return record.type === expectedType && typeof record.sdp === 'string'
+    ? { type: expectedType, sdp: record.sdp }
+    : null;
+}
+
+function coerceGaiaP2PVoiceIceCandidate(value: unknown): GaiaP2PVoiceIceCandidate | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.candidate !== 'string') {
+    return null;
+  }
+  return {
+    candidate: record.candidate,
+    sdpMid: typeof record.sdpMid === 'string' || record.sdpMid === null ? record.sdpMid : undefined,
+    sdpMLineIndex:
+      typeof record.sdpMLineIndex === 'number' || record.sdpMLineIndex === null
+        ? record.sdpMLineIndex
+        : undefined,
+    usernameFragment:
+      typeof record.usernameFragment === 'string' || record.usernameFragment === null
+        ? record.usernameFragment
+        : undefined,
+  };
+}
 
 export interface GaiaStore {
   version: 1;
@@ -452,6 +543,62 @@ export interface GaiaBskyMessageDeleteRequest {
 export interface GaiaBskyReadRequest {
   convoId: string;
   messageId?: string;
+}
+
+export interface GaiaBskyCallKey {
+  did: string;
+  deviceId: string;
+  keyId: string;
+  createdAt: string;
+  updatedAt: string;
+  encryptedLocally: boolean;
+}
+
+export interface GaiaBskyCallSignalSource {
+  repoDid: string;
+  uri: string;
+  cid?: string;
+  rkey: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface GaiaBskyCallSignal {
+  convoId: string;
+  senderDid: string;
+  signal: GaiaP2PVoiceSignalMessage;
+  source: GaiaBskyCallSignalSource;
+}
+
+export interface GaiaBskyCallSignalPage {
+  cursor?: string;
+  signals: GaiaBskyCallSignal[];
+}
+
+export interface GaiaBskyPublishCallSignalRequest {
+  peerDid: string;
+  convoId: string;
+  signal: GaiaP2PVoiceSignalMessage;
+}
+
+export interface GaiaBskyPublishCallSignalResponse {
+  uri: string;
+  cid?: string;
+  rkey: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface GaiaBskyListCallSignalsRequest {
+  peerDid: string;
+  convoId: string;
+  cursor?: string;
+  limit?: number;
+  ignoreBefore?: string;
+}
+
+export interface GaiaBskyDeleteCallSignalsRequest {
+  rkeys: string[];
 }
 
 export interface GaiaGifSearchRequest {

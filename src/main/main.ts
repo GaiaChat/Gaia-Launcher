@@ -6,6 +6,7 @@ import {
   Notification,
   nativeImage,
   nativeTheme,
+  safeStorage,
   shell,
   session,
   type Event as ElectronEvent,
@@ -23,12 +24,30 @@ import type {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
 import { isIP, type AddressInfo } from 'node:net';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  diffieHellman,
+  generateKeyPairSync,
+  hkdfSync,
+  randomBytes,
+  randomUUID,
+  sign as cryptoSign,
+  verify as cryptoVerify,
+  type KeyObject,
+} from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type {
+  GaiaBskyCallKey,
+  GaiaBskyCallSignal,
+  GaiaBskyCallSignalPage,
+  GaiaBskyDeleteCallSignalsRequest,
   GaiaBskyActor,
   GaiaBskyActorSearchRequest,
   GaiaBskyConvo,
@@ -40,6 +59,9 @@ import type {
   GaiaBskyMessagePage,
   GaiaBskyMessagesRequest,
   GaiaBskyPageRequest,
+  GaiaBskyListCallSignalsRequest,
+  GaiaBskyPublishCallSignalRequest,
+  GaiaBskyPublishCallSignalResponse,
   GaiaBskyReadRequest,
   GaiaBskyReaction,
   GaiaBskyReactionRequest,
@@ -58,6 +80,7 @@ import type {
   GaiaOAuthStartRequest,
   GaiaOAuthStartResponse,
   GaiaP2PVoiceSettings,
+  GaiaP2PVoiceSignalMessage,
   GaiaP2PVoiceTurnServer,
   GaiaServerClientAuthResult,
   GaiaServer,
@@ -81,6 +104,7 @@ import type {
   GaiaVideoSettings,
   GaiaVisualEffectsSettings,
 } from '../shared.js';
+import { coerceGaiaP2PVoiceSignalMessage } from '../shared.js';
 import {
   checkGaiaUpdates,
   configureGaiaUpdater,
@@ -111,6 +135,13 @@ const SPOTIFY_CALLBACK_PATH = '/spotify/oauth/callback';
 const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
 const BSKY_AUTH_SCOPE = 'atproto transition:generic transition:chat.bsky';
 const BSKY_CHAT_PROXY = 'did:web:api.bsky.chat#bsky_chat';
+const GAIA_CALL_RECORD_APP = 'gaia-launcher';
+const GAIA_CALL_KEY_COLLECTION = 'chat.gaia.call.key';
+const GAIA_CALL_SIGNAL_COLLECTION = 'chat.gaia.call.signal';
+const GAIA_CALL_KEY_RKEY = 'self';
+const GAIA_CALL_SIGNAL_TTL_MS = 5 * 60 * 1000;
+const GAIA_CALL_SIGNAL_MAX_DECRYPT_PER_POLL = 120;
+const GAIA_CALL_DEVICE_KEY_FILE_PREFIX = 'bsky-call-device-key';
 const BSKY_STATE_TTL_MS = 60 * 60 * 1000;
 const SPOTIFY_CLIENT_ID = process.env.GAIA_SPOTIFY_CLIENT_ID?.trim() || '66d50f82108549d4a7a5c25d8c88eb40';
 const SPOTIFY_REDIRECT_URI =
@@ -140,6 +171,86 @@ type CurrentPermissionDetails = {
   isDirectory?: boolean;
 };
 
+interface GaiaCallDeviceKeyMaterial {
+  version: 1;
+  did: string;
+  deviceId: string;
+  keyId: string;
+  encryptionPrivateKey: string;
+  encryptionPublicKey: string;
+  signingPrivateKey: string;
+  signingPublicKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface GaiaCallDeviceKeyFile {
+  version: 1;
+  encrypted: boolean;
+  data: string;
+}
+
+interface GaiaCallPublicKeyRecord {
+  $type: string;
+  app: string;
+  version: 1;
+  did: string;
+  keyId: string;
+  encryptionPublicKey: string;
+  signingPublicKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface GaiaCallPublicKey {
+  did: string;
+  keyId: string;
+  encryptionPublicKey: string;
+  signingPublicKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface GaiaEncryptedCallSignalRecord {
+  $type: string;
+  app: string;
+  version: 1;
+  encoding: 'json+x25519-a256gcm-ed25519';
+  fromDid: string;
+  fromKeyId: string;
+  createdAt: string;
+  expiresAt: string;
+  nonce: string;
+  ciphertext: string;
+  tag: string;
+  signature: string;
+}
+
+interface GaiaEncryptedCallSignalPayload {
+  version: 1;
+  app: string;
+  senderDid: string;
+  senderKeyId: string;
+  recipientDid: string;
+  recipientKeyId: string;
+  convoId: string;
+  createdAt: string;
+  expiresAt: string;
+  signal: unknown;
+}
+
+interface GaiaRepoRecordView {
+  uri: string;
+  cid?: string;
+  value?: unknown;
+}
+
+interface GaiaDidDocumentService {
+  id?: unknown;
+  type?: unknown;
+  serviceEndpoint?: unknown;
+}
+
 app.setName('Gaia Launcher');
 if (process.platform === 'win32') {
   app.setAppUserModelId(GAIA_APP_ID);
@@ -153,6 +264,7 @@ if (process.platform === 'linux') {
 let gaiaLogoDataUrlCache: string | undefined | null;
 let storeMutationQueue: Promise<void> = Promise.resolve();
 let notificationMutationQueue: Promise<void> = Promise.resolve();
+const didPdsEndpointCache = new Map<string, string | null>();
 
 interface ColorPickPoint {
   x?: number;
@@ -1313,6 +1425,10 @@ function defaultVideoSettings(): GaiaVideoSettings {
 function defaultP2PVoiceSettings(): GaiaP2PVoiceSettings {
   return {
     turnServers: [],
+    signaling: 'atproto-record',
+    incomingCalls: 'accepted-conversations',
+    incomingCallNotifications: true,
+    respectConversationMute: true,
   };
 }
 
@@ -2165,12 +2281,28 @@ function coerceVideoSettings(raw: Partial<GaiaVideoSettings> | undefined | null)
 
 function coerceP2PVoiceSettings(raw: Partial<GaiaP2PVoiceSettings> | undefined | null): GaiaP2PVoiceSettings {
   const fallback = defaultP2PVoiceSettings();
-  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.turnServers)) {
+  if (!raw || typeof raw !== 'object') {
     return fallback;
   }
 
   return {
-    turnServers: raw.turnServers
+    signaling:
+      raw.signaling === 'atproto-record' || raw.signaling === 'bsky-dm'
+        ? raw.signaling
+        : fallback.signaling,
+    incomingCalls:
+      raw.incomingCalls === 'accepted-conversations' || raw.incomingCalls === 'none'
+        ? raw.incomingCalls
+        : fallback.incomingCalls,
+    incomingCallNotifications:
+      typeof raw.incomingCallNotifications === 'boolean'
+        ? raw.incomingCallNotifications
+        : fallback.incomingCallNotifications,
+    respectConversationMute:
+      typeof raw.respectConversationMute === 'boolean'
+        ? raw.respectConversationMute
+        : fallback.respectConversationMute,
+    turnServers: (Array.isArray(raw.turnServers) ? raw.turnServers : [])
       .map((server): GaiaP2PVoiceTurnServer | null => {
         if (!server || typeof server !== 'object') {
           return null;
@@ -3109,6 +3241,748 @@ async function bskyChatPost<T>(oauthSession: OAuthSession, method: string, body:
   }
 
   return (await response.json()) as T;
+}
+
+async function xrpcErrorMessage(response: Response, method: string): Promise<string> {
+  let message = `${method} failed with ${response.status}.`;
+  try {
+    const payload = (await response.json()) as { message?: string; error?: string };
+    message = payload.message ?? payload.error ?? message;
+  } catch {
+    // Keep status fallback.
+  }
+  return message;
+}
+
+async function bskyRepoPost<T>(oauthSession: OAuthSession, method: string, body: unknown): Promise<T> {
+  const response = await oauthSession.fetchHandler(`/xrpc/${method}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12_000),
+  });
+
+  if (!response.ok) {
+    throw new Error(await xrpcErrorMessage(response, method));
+  }
+
+  return (await response.json()) as T;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function base64UrlEncode(value: Buffer | string): string {
+  return Buffer.from(value).toString('base64url');
+}
+
+function base64UrlDecode(value: string): Buffer {
+  return Buffer.from(value, 'base64url');
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableJsonValue);
+  }
+  if (!isPlainRecord(value)) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .filter((key) => typeof value[key] !== 'undefined')
+      .map((key) => [key, stableJsonValue(value[key])]),
+  );
+}
+
+function safeRecordKey(value: string): string | null {
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._~-]{1,512}$/.test(trimmed) ? trimmed : null;
+}
+
+function rkeyFromAtUri(uri: string): string | undefined {
+  const parts = uri.split('/');
+  return safeRecordKey(parts.at(-1) ?? '') ?? undefined;
+}
+
+function callKeyLocalEncryptionAvailable(): boolean {
+  try {
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
+  }
+}
+
+function bskyCallDeviceKeyPath(did: string): string {
+  const digest = createHash('sha256').update(did).digest('hex').slice(0, 24);
+  return join(app.getPath('userData'), `${GAIA_CALL_DEVICE_KEY_FILE_PREFIX}-${digest}.json`);
+}
+
+function exportKeyDer(key: KeyObject, type: 'pkcs8' | 'spki'): string {
+  return key.export({ format: 'der', type }).toString('base64url');
+}
+
+function importPrivateKeyDer(value: string): KeyObject {
+  return createPrivateKey({
+    key: base64UrlDecode(value),
+    format: 'der',
+    type: 'pkcs8',
+  });
+}
+
+function importPublicKeyDer(value: string): KeyObject {
+  return createPublicKey({
+    key: base64UrlDecode(value),
+    format: 'der',
+    type: 'spki',
+  });
+}
+
+function callKeyId(encryptionPublicKey: string, signingPublicKey: string): string {
+  return `key_${createHash('sha256')
+    .update(`${encryptionPublicKey}.${signingPublicKey}`)
+    .digest('base64url')
+    .slice(0, 28)}`;
+}
+
+function createGaiaCallDeviceKeyMaterial(did: string): GaiaCallDeviceKeyMaterial {
+  const createdAt = nowIso();
+  const encryptionKeys = generateKeyPairSync('x25519');
+  const signingKeys = generateKeyPairSync('ed25519');
+  const encryptionPublicKey = exportKeyDer(encryptionKeys.publicKey, 'spki');
+  const signingPublicKey = exportKeyDer(signingKeys.publicKey, 'spki');
+  return {
+    version: 1,
+    did,
+    deviceId: createId('call_device'),
+    keyId: callKeyId(encryptionPublicKey, signingPublicKey),
+    encryptionPrivateKey: exportKeyDer(encryptionKeys.privateKey, 'pkcs8'),
+    encryptionPublicKey,
+    signingPrivateKey: exportKeyDer(signingKeys.privateKey, 'pkcs8'),
+    signingPublicKey,
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+function sealGaiaCallDeviceKeyMaterial(material: GaiaCallDeviceKeyMaterial): GaiaCallDeviceKeyFile {
+  const serialized = JSON.stringify(material);
+  if (callKeyLocalEncryptionAvailable()) {
+    return {
+      version: 1,
+      encrypted: true,
+      data: base64UrlEncode(safeStorage.encryptString(serialized)),
+    };
+  }
+  return {
+    version: 1,
+    encrypted: false,
+    data: base64UrlEncode(serialized),
+  };
+}
+
+function unsealGaiaCallDeviceKeyMaterial(file: GaiaCallDeviceKeyFile): GaiaCallDeviceKeyMaterial | null {
+  try {
+    const serialized = file.encrypted
+      ? safeStorage.decryptString(base64UrlDecode(file.data))
+      : base64UrlDecode(file.data).toString('utf8');
+    const material = JSON.parse(serialized) as Partial<GaiaCallDeviceKeyMaterial>;
+    if (
+      material.version !== 1 ||
+      typeof material.did !== 'string' ||
+      typeof material.deviceId !== 'string' ||
+      typeof material.keyId !== 'string' ||
+      typeof material.encryptionPrivateKey !== 'string' ||
+      typeof material.encryptionPublicKey !== 'string' ||
+      typeof material.signingPrivateKey !== 'string' ||
+      typeof material.signingPublicKey !== 'string' ||
+      typeof material.createdAt !== 'string' ||
+      typeof material.updatedAt !== 'string'
+    ) {
+      return null;
+    }
+    return material as GaiaCallDeviceKeyMaterial;
+  } catch {
+    return null;
+  }
+}
+
+async function readGaiaCallDeviceKeyMaterial(did: string): Promise<GaiaCallDeviceKeyMaterial | null> {
+  try {
+    const file = JSON.parse(await readFile(bskyCallDeviceKeyPath(did), 'utf8')) as Partial<GaiaCallDeviceKeyFile>;
+    if (file.version !== 1 || typeof file.encrypted !== 'boolean' || typeof file.data !== 'string') {
+      return null;
+    }
+    const material = unsealGaiaCallDeviceKeyMaterial(file as GaiaCallDeviceKeyFile);
+    return material?.did === did ? material : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveGaiaCallDeviceKeyMaterial(material: GaiaCallDeviceKeyMaterial): Promise<void> {
+  const path = bskyCallDeviceKeyPath(material.did);
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const tempPath = uniqueTempPath(path);
+  await writeFile(tempPath, `${JSON.stringify(sealGaiaCallDeviceKeyMaterial(material), null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  await rename(tempPath, path);
+}
+
+async function ensureGaiaCallDeviceKeyMaterial(did: string): Promise<GaiaCallDeviceKeyMaterial> {
+  const existing = await readGaiaCallDeviceKeyMaterial(did);
+  if (existing) {
+    return existing;
+  }
+  const material = createGaiaCallDeviceKeyMaterial(did);
+  await saveGaiaCallDeviceKeyMaterial(material);
+  return material;
+}
+
+function gaiaCallPublicKeyRecord(material: GaiaCallDeviceKeyMaterial): GaiaCallPublicKeyRecord {
+  return {
+    $type: GAIA_CALL_KEY_COLLECTION,
+    app: GAIA_CALL_RECORD_APP,
+    version: 1,
+    did: material.did,
+    keyId: material.keyId,
+    encryptionPublicKey: material.encryptionPublicKey,
+    signingPublicKey: material.signingPublicKey,
+    createdAt: material.createdAt,
+    updatedAt: nowIso(),
+  };
+}
+
+function parseGaiaCallPublicKeyRecord(value: unknown, did: string): GaiaCallPublicKey | null {
+  if (!isPlainRecord(value)) {
+    return null;
+  }
+  if (
+    value.$type !== GAIA_CALL_KEY_COLLECTION ||
+    value.app !== GAIA_CALL_RECORD_APP ||
+    value.version !== 1 ||
+    value.did !== did ||
+    typeof value.keyId !== 'string' ||
+    typeof value.encryptionPublicKey !== 'string' ||
+    typeof value.signingPublicKey !== 'string' ||
+    typeof value.createdAt !== 'string' ||
+    typeof value.updatedAt !== 'string'
+  ) {
+    return null;
+  }
+  if (callKeyId(value.encryptionPublicKey, value.signingPublicKey) !== value.keyId) {
+    return null;
+  }
+  try {
+    importPublicKeyDer(value.encryptionPublicKey);
+    importPublicKeyDer(value.signingPublicKey);
+  } catch {
+    return null;
+  }
+  return {
+    did,
+    keyId: value.keyId,
+    encryptionPublicKey: value.encryptionPublicKey,
+    signingPublicKey: value.signingPublicKey,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+function normalizeAtprotoServiceEndpoint(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return null;
+    }
+    parsed.username = '';
+    parsed.password = '';
+    parsed.hash = '';
+    parsed.search = '';
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+}
+
+function getDidWebDocumentUrl(did: string): string | null {
+  if (!did.startsWith('did:web:')) {
+    return null;
+  }
+  const parts = did
+    .slice('did:web:'.length)
+    .split(':')
+    .map((part) => decodeURIComponent(part));
+  const host = parts.shift();
+  if (!host) {
+    return null;
+  }
+  return parts.length > 0 ? `https://${host}/${parts.join('/')}/did.json` : `https://${host}/.well-known/did.json`;
+}
+
+function pdsEndpointFromDidDocument(value: unknown): string | null {
+  if (!isPlainRecord(value) || !Array.isArray(value.service)) {
+    return null;
+  }
+  for (const rawService of value.service) {
+    const service = rawService as GaiaDidDocumentService;
+    const isAtprotoPds =
+      service.type === 'AtprotoPersonalDataServer' ||
+      (typeof service.id === 'string' && service.id.endsWith('#atproto_pds'));
+    if (isAtprotoPds && typeof service.serviceEndpoint === 'string') {
+      const endpoint = normalizeAtprotoServiceEndpoint(service.serviceEndpoint);
+      if (endpoint) {
+        return endpoint;
+      }
+    }
+  }
+  return null;
+}
+
+async function resolveAtprotoPdsEndpoint(did: string): Promise<string | null> {
+  const normalizedDid = did.trim();
+  if (didPdsEndpointCache.has(normalizedDid)) {
+    return didPdsEndpointCache.get(normalizedDid) ?? null;
+  }
+  const documentUrl = normalizedDid.startsWith('did:plc:')
+    ? `https://plc.directory/${encodeURIComponent(normalizedDid)}`
+    : getDidWebDocumentUrl(normalizedDid);
+  if (!documentUrl) {
+    didPdsEndpointCache.set(normalizedDid, null);
+    return null;
+  }
+
+  try {
+    const response = await fetch(documentUrl, {
+      cache: 'force-cache',
+      redirect: 'error',
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      didPdsEndpointCache.set(normalizedDid, null);
+      return null;
+    }
+    const endpoint = pdsEndpointFromDidDocument(await response.json().catch(() => null));
+    didPdsEndpointCache.set(normalizedDid, endpoint);
+    return endpoint;
+  } catch {
+    didPdsEndpointCache.set(normalizedDid, null);
+    return null;
+  }
+}
+
+async function publicRepoGetRecord(did: string, collection: string, rkey: string): Promise<GaiaRepoRecordView | null> {
+  const endpoint = await resolveAtprotoPdsEndpoint(did);
+  if (!endpoint) {
+    return null;
+  }
+  const url = new URL('/xrpc/com.atproto.repo.getRecord', endpoint);
+  url.searchParams.set('repo', did);
+  url.searchParams.set('collection', collection);
+  url.searchParams.set('rkey', rkey);
+
+  const response = await fetch(url, {
+    cache: 'no-cache',
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(await xrpcErrorMessage(response, 'com.atproto.repo.getRecord'));
+  }
+  const body = (await response.json().catch(() => null)) as GaiaRepoRecordView | null;
+  return body && typeof body.uri === 'string' ? body : null;
+}
+
+async function publicRepoListRecords(
+  did: string,
+  collection: string,
+  request: { cursor?: string; limit: number },
+): Promise<{ cursor?: string; records: GaiaRepoRecordView[] }> {
+  const endpoint = await resolveAtprotoPdsEndpoint(did);
+  if (!endpoint) {
+    return { records: [] };
+  }
+  const url = new URL('/xrpc/com.atproto.repo.listRecords', endpoint);
+  url.searchParams.set('repo', did);
+  url.searchParams.set('collection', collection);
+  url.searchParams.set('limit', String(request.limit));
+  url.searchParams.set('reverse', 'true');
+  if (request.cursor) {
+    url.searchParams.set('cursor', request.cursor);
+  }
+
+  const response = await fetch(url, {
+    cache: 'no-cache',
+    signal: AbortSignal.timeout(12_000),
+  });
+  if (response.status === 404) {
+    return { records: [] };
+  }
+  if (!response.ok) {
+    throw new Error(await xrpcErrorMessage(response, 'com.atproto.repo.listRecords'));
+  }
+
+  const body = (await response.json().catch(() => null)) as { cursor?: string; records?: unknown[] } | null;
+  const records = Array.isArray(body?.records)
+    ? body.records.filter((record): record is GaiaRepoRecordView => {
+        return isPlainRecord(record) && typeof record.uri === 'string';
+      })
+    : [];
+  return {
+    cursor: typeof body?.cursor === 'string' ? body.cursor : undefined,
+    records,
+  };
+}
+
+const bskyCallKeyPublishCache = new Map<string, string>();
+
+async function ensureBskyCallKeyRecord(oauthSession?: OAuthSession): Promise<GaiaBskyCallKey> {
+  const session = oauthSession ?? (await requireBskySession());
+  const material = await ensureGaiaCallDeviceKeyMaterial(session.did);
+  const cacheKey = `${session.did}:${material.keyId}`;
+  if (bskyCallKeyPublishCache.get(session.did) !== material.keyId) {
+    await bskyRepoPost<{ uri?: string; cid?: string }>(session, 'com.atproto.repo.putRecord', {
+      repo: session.did,
+      collection: GAIA_CALL_KEY_COLLECTION,
+      rkey: GAIA_CALL_KEY_RKEY,
+      validate: false,
+      record: gaiaCallPublicKeyRecord(material),
+    });
+    bskyCallKeyPublishCache.set(session.did, material.keyId);
+  }
+  return {
+    did: material.did,
+    deviceId: material.deviceId,
+    keyId: material.keyId,
+    createdAt: material.createdAt,
+    updatedAt: material.updatedAt,
+    encryptedLocally: callKeyLocalEncryptionAvailable(),
+  };
+}
+
+async function getBskyPublicCallKey(did: string): Promise<GaiaCallPublicKey | null> {
+  const record = await publicRepoGetRecord(did, GAIA_CALL_KEY_COLLECTION, GAIA_CALL_KEY_RKEY);
+  return parseGaiaCallPublicKeyRecord(record?.value, did);
+}
+
+function createCallSignalRkey(): string {
+  return `sig-${Date.now().toString(36)}-${randomBytes(8).toString('hex')}`;
+}
+
+function deriveCallSignalSecret(input: {
+  localPrivateKey: string;
+  peerPublicKey: string;
+  senderDid: string;
+  recipientDid: string;
+  senderKeyId: string;
+  recipientKeyId: string;
+}): Buffer {
+  const shared = diffieHellman({
+    privateKey: importPrivateKeyDer(input.localPrivateKey),
+    publicKey: importPublicKeyDer(input.peerPublicKey),
+  });
+  const salt = createHash('sha256')
+    .update(
+      [
+        'gaia-call-signal-v1',
+        input.senderDid,
+        input.recipientDid,
+        input.senderKeyId,
+        input.recipientKeyId,
+      ].join('\n'),
+    )
+    .digest();
+  return Buffer.from(hkdfSync('sha256', shared, salt, Buffer.from('Gaia encrypted ATProto call signal'), 32));
+}
+
+function unsignedCallSignalRecord(
+  record: GaiaEncryptedCallSignalRecord,
+): Omit<GaiaEncryptedCallSignalRecord, 'signature'> {
+  const { signature: _signature, ...unsigned } = record;
+  return unsigned;
+}
+
+function parseEncryptedCallSignalRecord(value: unknown): GaiaEncryptedCallSignalRecord | null {
+  if (!isPlainRecord(value)) {
+    return null;
+  }
+  if (
+    value.$type !== GAIA_CALL_SIGNAL_COLLECTION ||
+    value.app !== GAIA_CALL_RECORD_APP ||
+    value.version !== 1 ||
+    value.encoding !== 'json+x25519-a256gcm-ed25519' ||
+    typeof value.fromDid !== 'string' ||
+    typeof value.fromKeyId !== 'string' ||
+    typeof value.createdAt !== 'string' ||
+    typeof value.expiresAt !== 'string' ||
+    typeof value.nonce !== 'string' ||
+    typeof value.ciphertext !== 'string' ||
+    typeof value.tag !== 'string' ||
+    typeof value.signature !== 'string'
+  ) {
+    return null;
+  }
+  return value as unknown as GaiaEncryptedCallSignalRecord;
+}
+
+function encryptCallSignalRecord(input: {
+  local: GaiaCallDeviceKeyMaterial;
+  peer: GaiaCallPublicKey;
+  convoId: string;
+  signal: GaiaP2PVoiceSignalMessage;
+}): GaiaEncryptedCallSignalRecord {
+  const createdAt = nowIso();
+  const expiresAt = new Date(Date.now() + GAIA_CALL_SIGNAL_TTL_MS).toISOString();
+  const nonce = randomBytes(12);
+  const key = deriveCallSignalSecret({
+    localPrivateKey: input.local.encryptionPrivateKey,
+    peerPublicKey: input.peer.encryptionPublicKey,
+    senderDid: input.local.did,
+    recipientDid: input.peer.did,
+    senderKeyId: input.local.keyId,
+    recipientKeyId: input.peer.keyId,
+  });
+  const payload: GaiaEncryptedCallSignalPayload = {
+    version: 1,
+    app: GAIA_CALL_RECORD_APP,
+    senderDid: input.local.did,
+    senderKeyId: input.local.keyId,
+    recipientDid: input.peer.did,
+    recipientKeyId: input.peer.keyId,
+    convoId: input.convoId,
+    createdAt,
+    expiresAt,
+    signal: input.signal,
+  };
+  const cipher = createCipheriv('aes-256-gcm', key, nonce);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const unsigned: Omit<GaiaEncryptedCallSignalRecord, 'signature'> = {
+    $type: GAIA_CALL_SIGNAL_COLLECTION,
+    app: GAIA_CALL_RECORD_APP,
+    version: 1,
+    encoding: 'json+x25519-a256gcm-ed25519',
+    fromDid: input.local.did,
+    fromKeyId: input.local.keyId,
+    createdAt,
+    expiresAt,
+    nonce: base64UrlEncode(nonce),
+    ciphertext: base64UrlEncode(ciphertext),
+    tag: base64UrlEncode(cipher.getAuthTag()),
+  };
+  const signature = cryptoSign(null, Buffer.from(stableJson(unsigned)), importPrivateKeyDer(input.local.signingPrivateKey));
+  return {
+    ...unsigned,
+    signature: base64UrlEncode(signature),
+  };
+}
+
+async function decryptCallSignalRecord(input: {
+  local: GaiaCallDeviceKeyMaterial;
+  peerDid: string;
+  convoId: string;
+  ignoreBeforeMs: number;
+  view: GaiaRepoRecordView;
+}): Promise<GaiaBskyCallSignal | null> {
+  const record = parseEncryptedCallSignalRecord(input.view.value);
+  if (!record || record.fromDid !== input.peerDid) {
+    return null;
+  }
+  const createdAtMs = Date.parse(record.createdAt);
+  const expiresAtMs = Date.parse(record.expiresAt);
+  if (
+    !Number.isFinite(createdAtMs) ||
+    !Number.isFinite(expiresAtMs) ||
+    expiresAtMs <= Date.now() ||
+    (input.ignoreBeforeMs > 0 && createdAtMs < input.ignoreBeforeMs)
+  ) {
+    return null;
+  }
+
+  const senderKey = await getBskyPublicCallKey(record.fromDid);
+  if (!senderKey || senderKey.keyId !== record.fromKeyId) {
+    return null;
+  }
+
+  const signatureOk = cryptoVerify(
+    null,
+    Buffer.from(stableJson(unsignedCallSignalRecord(record))),
+    importPublicKeyDer(senderKey.signingPublicKey),
+    base64UrlDecode(record.signature),
+  );
+  if (!signatureOk) {
+    return null;
+  }
+
+  try {
+    const key = deriveCallSignalSecret({
+      localPrivateKey: input.local.encryptionPrivateKey,
+      peerPublicKey: senderKey.encryptionPublicKey,
+      senderDid: senderKey.did,
+      recipientDid: input.local.did,
+      senderKeyId: senderKey.keyId,
+      recipientKeyId: input.local.keyId,
+    });
+    const decipher = createDecipheriv('aes-256-gcm', key, base64UrlDecode(record.nonce));
+    decipher.setAuthTag(base64UrlDecode(record.tag));
+    const plaintext = Buffer.concat([
+      decipher.update(base64UrlDecode(record.ciphertext)),
+      decipher.final(),
+    ]).toString('utf8');
+    const payload = JSON.parse(plaintext) as Partial<GaiaEncryptedCallSignalPayload>;
+    if (
+      payload.version !== 1 ||
+      payload.app !== GAIA_CALL_RECORD_APP ||
+      payload.senderDid !== record.fromDid ||
+      payload.senderKeyId !== record.fromKeyId ||
+      payload.recipientDid !== input.local.did ||
+      payload.recipientKeyId !== input.local.keyId ||
+      payload.convoId !== input.convoId ||
+      typeof payload.createdAt !== 'string' ||
+      typeof payload.expiresAt !== 'string'
+    ) {
+      return null;
+    }
+    const signal = coerceGaiaP2PVoiceSignalMessage(payload.signal);
+    if (!signal) {
+      return null;
+    }
+    return {
+      convoId: input.convoId,
+      senderDid: record.fromDid,
+      signal,
+      source: {
+        repoDid: input.peerDid,
+        uri: input.view.uri,
+        cid: input.view.cid,
+        rkey: rkeyFromAtUri(input.view.uri) ?? '',
+        createdAt: record.createdAt,
+        expiresAt: record.expiresAt,
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function publishBskyCallSignal(
+  request: GaiaBskyPublishCallSignalRequest,
+): Promise<GaiaBskyPublishCallSignalResponse> {
+  const peerDid = request.peerDid.trim();
+  const convoId = request.convoId.trim();
+  const signal = coerceGaiaP2PVoiceSignalMessage(request.signal);
+  if (!peerDid || !convoId || !signal) {
+    throw new Error('Call recipient, conversation, and signal are required.');
+  }
+
+  const oauthSession = await requireBskySession();
+  const localKey = await ensureBskyCallKeyRecord(oauthSession);
+  const local = await ensureGaiaCallDeviceKeyMaterial(oauthSession.did);
+  if (localKey.keyId !== local.keyId) {
+    throw new Error('Local Gaia Call key is not ready.');
+  }
+  const peerKey = await getBskyPublicCallKey(peerDid);
+  if (!peerKey) {
+    throw new Error('This person needs the latest Gaia Launcher before they can receive native calls.');
+  }
+
+  const record = encryptCallSignalRecord({
+    local,
+    peer: peerKey,
+    convoId,
+    signal,
+  });
+  const rkey = createCallSignalRkey();
+  const response = await bskyRepoPost<{ uri?: string; cid?: string }>(oauthSession, 'com.atproto.repo.putRecord', {
+    repo: oauthSession.did,
+    collection: GAIA_CALL_SIGNAL_COLLECTION,
+    rkey,
+    validate: false,
+    record,
+  });
+  const uri = typeof response.uri === 'string'
+    ? response.uri
+    : `at://${oauthSession.did}/${GAIA_CALL_SIGNAL_COLLECTION}/${rkey}`;
+  return {
+    uri,
+    cid: typeof response.cid === 'string' ? response.cid : undefined,
+    rkey,
+    createdAt: record.createdAt,
+    expiresAt: record.expiresAt,
+  };
+}
+
+async function listBskyCallSignals(request: GaiaBskyListCallSignalsRequest): Promise<GaiaBskyCallSignalPage> {
+  const peerDid = request.peerDid.trim();
+  const convoId = request.convoId.trim();
+  if (!peerDid || !convoId) {
+    throw new Error('Call peer and conversation are required.');
+  }
+
+  const oauthSession = await requireBskySession();
+  await ensureBskyCallKeyRecord(oauthSession);
+  const local = await ensureGaiaCallDeviceKeyMaterial(oauthSession.did);
+  const page = await publicRepoListRecords(peerDid, GAIA_CALL_SIGNAL_COLLECTION, {
+    cursor: request.cursor,
+    limit: Math.min(
+      GAIA_CALL_SIGNAL_MAX_DECRYPT_PER_POLL,
+      clampLimit(request.limit, 50, GAIA_CALL_SIGNAL_MAX_DECRYPT_PER_POLL),
+    ),
+  });
+  const ignoreBeforeMs = request.ignoreBefore ? Date.parse(request.ignoreBefore) : 0;
+  const signals: GaiaBskyCallSignal[] = [];
+  for (const view of page.records) {
+    const signal = await decryptCallSignalRecord({
+      local,
+      peerDid,
+      convoId,
+      ignoreBeforeMs: Number.isFinite(ignoreBeforeMs) ? ignoreBeforeMs : 0,
+      view,
+    });
+    if (signal?.source.rkey) {
+      signals.push(signal);
+    }
+  }
+
+  signals.sort((left, right) => Date.parse(left.source.createdAt) - Date.parse(right.source.createdAt));
+  return {
+    cursor: page.cursor,
+    signals,
+  };
+}
+
+async function deleteBskyCallSignals(request: GaiaBskyDeleteCallSignalsRequest): Promise<{ deleted: number }> {
+  const rkeys = Array.from(new Set(request.rkeys.map((rkey) => safeRecordKey(rkey)).filter(Boolean))).slice(0, 100);
+  if (rkeys.length === 0) {
+    return { deleted: 0 };
+  }
+
+  const oauthSession = await requireBskySession();
+  let deleted = 0;
+  for (const rkey of rkeys) {
+    try {
+      await bskyRepoPost(oauthSession, 'com.atproto.repo.deleteRecord', {
+        repo: oauthSession.did,
+        collection: GAIA_CALL_SIGNAL_COLLECTION,
+        rkey,
+      });
+      deleted += 1;
+    } catch {
+      // Records are short-lived and may already be gone from another cleanup path.
+    }
+  }
+  return { deleted };
 }
 
 async function listBskyConvos(request: GaiaBskyPageRequest): Promise<GaiaBskyConvoPage> {
@@ -5196,6 +6070,34 @@ function registerIpc(): void {
     'launcher',
     async (_event, request: GaiaBskyReadRequest): Promise<GaiaBskyConvo> => {
       return updateBskyRead(request);
+    },
+  );
+
+  handleIpc('gaia:bsky:call:key:ensure', 'launcher', async (): Promise<GaiaBskyCallKey> => {
+    return ensureBskyCallKeyRecord();
+  });
+
+  handleIpc(
+    'gaia:bsky:call:signal:publish',
+    'launcher',
+    async (_event, request: GaiaBskyPublishCallSignalRequest): Promise<GaiaBskyPublishCallSignalResponse> => {
+      return publishBskyCallSignal(request);
+    },
+  );
+
+  handleIpc(
+    'gaia:bsky:call:signals:list',
+    'launcher',
+    async (_event, request: GaiaBskyListCallSignalsRequest): Promise<GaiaBskyCallSignalPage> => {
+      return listBskyCallSignals(request);
+    },
+  );
+
+  handleIpc(
+    'gaia:bsky:call:signals:delete',
+    'launcher',
+    async (_event, request: GaiaBskyDeleteCallSignalsRequest): Promise<{ deleted: number }> => {
+      return deleteBskyCallSignals(request);
     },
   );
 
